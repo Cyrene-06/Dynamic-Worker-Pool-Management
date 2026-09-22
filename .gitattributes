@@ -1,0 +1,10 @@
+# 统一换行符，避免 Windows 下出现整文件 diff
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary

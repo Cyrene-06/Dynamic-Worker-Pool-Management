@@ -1,0 +1,50 @@
+# ---- Go ----
+bin/
+dist/
+build/
+vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+coverage.out
+*.prof
+*.coverprofile
+
+# ---- 代码生成产物（由 make manifests / make generate 生成）----
+zz_generated.*.go
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+*.code-workspace
+*.swp
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 本地环境与机密（禁止入库）----
+.env
+.env.*
+*.pem
+*.key
+kubeconfig
+*.kubeconfig
+config/overlays/*/secrets/
+config/overlays/*/*-secret*.yaml
+
+# ---- 日志与临时文件 ----
+*.log
+logs/
+tmp/
