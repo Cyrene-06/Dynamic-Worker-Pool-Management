@@ -1,0 +1,99 @@
+# 控制面 RBAC —— 这份清单同时充当 docs/08 §8.2 的**可执行安全基线**。
+#
+# 核心原则：控制面被越权的后果是"全集群失守"，所以这里刻意不给某些权限，
+# 并且把"为什么不给"写在注释里 —— 否则下一个维护者很可能"顺手补上"。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-operator
+  namespace: sandbox-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-operator
+rules:
+  # ---- 自己的 CRD ----
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["agentsandboxes", "sandboxpools", "sandboxtemplates"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["agentsandboxes/status", "sandboxpools/status", "sandboxtemplates/status"]
+    verbs: ["get", "update", "patch"]
+
+  # ---- Pod 生命周期 ----
+  # 注意：**没有 update**。Pod 除了 status 与少数镜像字段外本就不可变，
+  # 给 update 只会扩大被误用的面。删除走 delete + ownerReference GC。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get", "patch"]
+
+  # ---- 节点健康（判 NodeLost 用）----
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+  # ---- 心跳 Lease ----
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ---- 网络策略 ----
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["cilium.io"]
+    resources: ["ciliumnetworkpolicies"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  # ---- 隔离级别可用性探测 ----
+  # RuntimeClass 只读：探测 kata-fc 是否存在。控制器绝不修改集群的运行时配置。
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "watch"]
+
+  # ---- 配置与事件 ----
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+# =============================================================================
+# 以下权限**刻意不授予**，任何 PR 想加都必须先过安全评审：
+#
+#   pods/exec、pods/portforward
+#       控制面永远不需要进入沙箱。一旦有了 exec 权限，控制面被攻破
+#       就等于拿到所有沙箱的交互式 shell —— 这是隔离设计的根本破坏。
+#       需要读沙箱内数据请走业务侧 API。
+#
+#   secrets 的 create/update/delete（含 get 也仅在必要时按 resourceNames 授予）
+#       把 Secret 挂进 Pod 由 kubelet 完成，控制面**不需要**读取明文凭据。
+#       所以骨架阶段完全不授予 secrets 权限。
+#
+#   nodes 的 delete/patch
+#       控制面只观测节点，从不动节点。节点由 Karpenter/CA 管理。
+#
+#   escalate、bind、impersonate
+#       提权三件套。放在 ClusterRole 里等于把 RBAC 体系一次性打开。
+#
+#   任何 * 通配符
+#       通配符会在集群新增 CRD 时静默扩大权限范围。
+# =============================================================================
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbox-operator
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-operator
+    namespace: sandbox-system

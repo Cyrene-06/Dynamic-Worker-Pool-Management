@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: sandbox-system
+
+# 这份 ConfigMap 是隔离级别的**运行时**事实来源。
+# 控制器每 60s 同步一次（骨架实现；M1 改为 Watch 事件驱动），
+# 且新配置非法时会**保留旧配置** —— 一次手抖的编辑不该让整个控制面失去隔离能力。
+configMapGenerator:
+  - name: sandbox-isolation
+    files:
+      - levels.yaml
+    options:
+      labels:
+        app.kubernetes.io/name: sandbox-isolation
+
+generatorOptions:
+  # 不加内容哈希后缀：控制器按固定名字查找这个 ConfigMap，
+  # 加后缀会让每次内容变更都变成一个新对象，控制器反而看不到更新。
+  disableNameSuffixHash: true

@@ -15,8 +15,14 @@ coverage.out
 *.prof
 *.coverprofile
 
-# ---- 代码生成产物（由 make manifests / make generate 生成）----
-zz_generated.*.go
+# ---- 代码生成产物 ----
+# 注意：zz_generated.deepcopy.go 必须入库（类型要满足 runtime.Object，
+# 缺它连 go build 都过不去），因此这里**不**忽略它。
+# 只忽略本地调试与构建残留。
+*.test.log
+.build.log
+.tidy.log
+.goproc.log
 
 # ---- IDE / 编辑器 ----
 .idea/

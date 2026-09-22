@@ -1,0 +1,65 @@
+# 隔离级别定义 —— 本项目的"环境适配层"唯一配置入口。
+#
+# docs/06 §1：CRD 与控制器只认隔离级别（simulated/runc/kata-fc/kata-clh），
+# 具体 RuntimeClass 名称、每 Pod 开销、是否允许超卖全部由这里决定。
+# 因此**同一份 AgentSandbox CR 可以在 kind 与生产之间平移**，
+# 控制器代码不需要任何 "if env == dev" 分支。
+#
+# 两条硬约束（由 internal/isolation 的 Validate 在启动时校验，不合法直接拒绝：
+#   1. VM 级隔离级别必须写 runtimeClassName。留空会让 kata-fc 静默地当成 runc 用
+#      —— 隔离强度无声消失，这是最危险的一类配置错误。
+#   2. overhead 必须是粒度（CPU 50m / 内存 64Mi）的整数倍。
+#      192Mi 满足（3×64），160Mi 不满足（2.5×64），后者会在装箱时系统性
+#      留下无法被任何档位使用的残留，直接推高碎片率（docs/07 §3.2）。
+levels:
+  # 本地开发专用：回落到集群默认运行时（runc）。
+  # 存在的意义是让状态机、池化、回收这些控制面逻辑在无 KVM 的机器上
+  # 100% 可测试，而生产仍然使用 VM 级隔离。
+  simulated:
+    runtimeClassName: ""
+    requiresKvm: false
+    allowOvercommit: false # 本地不做超卖：打开只会让排查变难
+    overhead:
+      cpuMilli: 0
+      memMiB: 0
+
+  # 可信负载专用。生产上只给平台内部组件使用。
+  runc:
+    runtimeClassName: ""
+    requiresKvm: false
+    allowOvercommit: true
+    overhead:
+      cpuMilli: 0
+      memMiB: 0
+
+  # 主力隔离方案：Kata + Firecracker。
+  # 唯一同时满足「VM 级隔离」+「亚秒启动」+「低每实例开销」的组合（docs/02 §D3）。
+  kata-fc:
+    runtimeClassName: kata-fc
+    requiresKvm: true
+    allowOvercommit: true
+    # 300m / 192Mi 都是粒度整数倍。注意 160Mi 会破坏对齐。
+    overhead:
+      cpuMilli: 300
+      memMiB: 192
+    nodeSelector:
+      sandbox.example.com/isolation: kata-fc
+    # 降级链。注意：只有 Pool 显式选择 FallbackToRunc 策略时才会被使用 ——
+    # 默认策略是 FailFast，宁可拒绝新建也不偷偷降低隔离强度。
+    fallbacks:
+      - kata-clh
+      - runc
+
+  # 需要更多设备能力时的折中（Cloud Hypervisor 支持 PCI/hotplug）。
+  # 已知代价：启动比 Firecracker 慢、每实例开销更高。
+  kata-clh:
+    runtimeClassName: kata-clh
+    requiresKvm: true
+    allowOvercommit: true
+    overhead:
+      cpuMilli: 300
+      memMiB: 256
+    nodeSelector:
+      sandbox.example.com/isolation: kata-clh
+    fallbacks:
+      - runc

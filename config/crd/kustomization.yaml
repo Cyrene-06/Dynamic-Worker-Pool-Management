@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 由 `make manifests` / `hack/verify.ps1 -Task manifests` 生成。
+# 注意：这三个文件必须入库 —— 它们是被评审的对象（CEL 规则、
+# 不可变字段、listType 都直接影响 API 行为），不应该只存在于生成器输出里。
+resources:
+  - bases/sandbox.example.com_agentsandboxes.yaml
+  - bases/sandbox.example.com_sandboxpools.yaml
+  - bases/sandbox.example.com_sandboxtemplates.yaml

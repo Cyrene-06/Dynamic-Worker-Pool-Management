@@ -1,0 +1,60 @@
+# 一个手工创建的沙箱，用于本地验证状态机与隔离抽象层。
+#
+# 生产中这个对象由 sandbox-gateway 创建（租户不直接操作 Kubernetes API）。
+# 这里手工写一份是为了让 E1 环境不依赖 gateway 也能跑通闭环。
+apiVersion: sandbox.example.com/v1alpha1
+kind: AgentSandbox
+metadata:
+  name: sbx-local-0001
+  namespace: sandbox-pool
+  labels:
+    sandbox.example.com/pool: fc-small
+    sandbox.example.com/tier: small
+    sandbox.example.com/template: python-3.12
+    sandbox.example.com/isolation: simulated
+    sandbox.example.com/claimed: "false"
+    sandbox.example.com/role: sandbox
+spec:
+  poolRef:
+    name: fc-small
+  templateRef:
+    name: python-3.12
+  tier: small
+
+  # 刻意留空：claim 为空 = 池中库存（phase 会走到 Ready）。
+  # 想验证"冷路径直接持有"，把下面这段解除注释即可 —— 此时 phase 会跳过
+  # Ready 直接进 Running。这个区别就是池水位统计的全部依据。
+  # claim:
+  #   requestedBy:
+  #     tenant: t-1001
+  #     sessionId: sess-local
+  #     principal: user:local
+  #     requestId: req-local-1
+  #   priorityClassName: sandbox-interactive
+
+  isolation: simulated
+
+  lifecycle:
+    ttlSecondsAfterCreation: 1800
+    idleTimeoutSeconds: 120
+    heartbeatGraceSeconds: 30
+    hibernateAfterIdleSeconds: 60
+    provisionTimeoutSeconds: 120
+    terminationGracePeriodSeconds: 30
+    reclaimPolicy: ReturnToPool
+    onHeartbeatLoss: Grace
+
+  hibernation:
+    enabled: true
+    mode: Freeze
+
+  state:
+    externalize: false
+
+  network:
+    egressProfile: default-llm
+
+  mounts:
+    - name: workspace
+      mountPath: /workspace
+      ephemeralSize: 1Gi

@@ -1,0 +1,87 @@
+# 平台策展的规格模板。租户没有写权限 —— 模板决定镜像与出口档位，
+# 属于安全边界的一部分（docs/08 §8.4）。
+apiVersion: sandbox.example.com/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: python-3.12
+spec:
+  image: registry.k8s.io/busybox:1.36
+  imagePullPolicy: IfNotPresent
+  command: ["sh", "-c", "sleep 86400"]
+  workingDir: /workspace
+
+  # 探针刻意用 exec 而不是 http：Kata 下 guest 网络栈就绪时间不确定，
+  # http 探针会把"网络还没好"误判成"沙箱没起来"，白白拉长冷路径。
+  readinessProbe:
+    exec:
+      command: ["true"]
+    periodSeconds: 2
+    failureThreshold: 3
+
+  allowedTiers: ["tiny", "small", "medium"]
+  defaultTier: small
+
+  defaults:
+    ttlSecondsAfterCreation: 3600
+    idleTimeoutSeconds: 300
+    heartbeatGraceSeconds: 60
+    reclaimPolicy: ReturnToPool
+    allowSameTenantReuse: true
+    maxClaimCount: 20
+
+  # 复用前必跑的清理脚本。同租户复用必须经过它，
+  # 否则会带来数据残留泄漏（docs/08 §7 T10）。
+  resetHook:
+    command: ["sh", "-c", "rm -rf /workspace/* /tmp/*"]
+    timeoutSeconds: 20
+
+  mounts:
+    - name: workspace
+      mountPath: /workspace
+      ephemeralSize: 1Gi
+
+  egressProfile: default-llm
+
+  isolation:
+    preferred: simulated
+    allowed: ["simulated", "runc", "kata-fc"]
+
+  sandboxEntrypointProcess: sleep
+---
+apiVersion: sandbox.example.com/v1alpha1
+kind: SandboxPool
+metadata:
+  name: fc-small
+spec:
+  # 池按「隔离级别 + 档位」划分，而不是按租户：
+  # 池的物理意义是资源规格，按租户预热会让小租户的命中率极差（docs/03 §3.1）。
+  isolation: simulated
+  tier: small
+  templateRef:
+    name: python-3.12
+  nodePoolSelector:
+    sandbox.example.com/isolation: kata-fc
+
+  scaling:
+    # 本地开发用小水位，便于肉眼观察扩缩行为。
+    minWarm: 2
+    maxWarm: 8
+    targetWarmBuffer: 2
+    # 刻意调小冷却期，让本地迭代时不用等 3 分钟才看到缩容。
+    dampening:
+      scaleUpCooldownSeconds: 5
+      scaleDownCooldownSeconds: 30
+      hysteresisRatioPermille: 100
+      ewmaAlphaPermille: 300
+
+  degradation:
+    # 本地用 FallbackToRunc：kind 上没有 kata-fc，FailFast 会让池完全不可用。
+    # 生产必须改回 FailFast —— 宁可拒绝新建，也不能把 VM 级隔离偷偷降成 runc。
+    onRuntimeUnavailable: FallbackToRunc
+    disableColdPath: false
+
+  priorityBands:
+    - className: sandbox-interactive
+      minWarmSharePermille: 700
+    - className: sandbox-batch
+      minWarmSharePermille: 300

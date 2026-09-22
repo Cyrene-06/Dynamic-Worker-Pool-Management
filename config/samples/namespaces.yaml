@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox-pool
+  labels:
+    # 平台管控的命名空间：租户不能直接操作这里面的对象（他们只走 gateway）。
+    # 这是 docs/04 §0 P1 的落地方式 —— Kubernetes RBAC 无法表达
+    # "只能看到属于自己租户的对象"，所以授权必须放在 gateway 层。
+    app.kubernetes.io/name: sandbox-pool
+    # 强制 restricted PSA：沙箱绝不允许 privileged / hostPath 可写 /
+    # 特权能力。需要例外的组件（node-agent）放独立命名空间，绝不放宽这里。
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sandbox-system
+  labels:
+    app.kubernetes.io/name: sandbox-system

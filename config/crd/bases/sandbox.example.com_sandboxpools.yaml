@@ -1,0 +1,391 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: sandboxpools.sandbox.example.com
+spec:
+  group: sandbox.example.com
+  names:
+    kind: SandboxPool
+    listKind: SandboxPoolList
+    plural: sandboxpools
+    shortNames:
+    - sbp
+    singular: sandboxpool
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.isolation
+      name: Isolation
+      type: string
+    - jsonPath: .spec.tier
+      name: Tier
+      type: string
+    - jsonPath: .status.warm
+      name: Warm
+      type: integer
+    - jsonPath: .status.target
+      name: Target
+      type: integer
+    - jsonPath: .status.hitRatio1hPermille
+      name: HitRatio1hPermille
+      type: integer
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: SandboxPool 是一组同规格沙箱的容量池。
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              SandboxPoolSpec 是池策略。
+
+              池按「隔离级别 + 规格档位」划分，而不是按租户划分：池的物理意义是资源规格，
+              按租户预热会导致小租户池命中率极差（docs/03 §3.1 的取舍记录）。
+            properties:
+              degradation:
+                description: PoolDegradation 是池的降级配置。
+                properties:
+                  disableColdPath:
+                    default: false
+                    description: DisableColdPath 为 true 时只服务池内申请，保护节点不被冷启动压垮。
+                    type: boolean
+                  onNodeFailuresAbovePercent:
+                    default: 30
+                    description: OnNodeFailuresAbovePercent 是节点故障率阈值，超过则暂停扩容，避免雪崩。
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                  onRuntimeUnavailable:
+                    default: FailFast
+                    description: DegradationPolicy 是运行时不可用时的降级策略。
+                    enum:
+                    - FailFast
+                    - FallbackToRunc
+                    - PauseScaling
+                    type: string
+                type: object
+              drain:
+                description: PoolDrain 是排空配置，用于升级前停止认领并回收库存。
+                properties:
+                  enabled:
+                    default: false
+                    type: boolean
+                  graceSeconds:
+                    default: 600
+                    description: GraceSeconds 是停止认领后等待现有会话自然结束的最长时间。
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  reason:
+                    description: Reason 记录排空原因（如 kata 升级），会写入 status 与事件便于追溯。
+                    type: string
+                type: object
+              isolation:
+                description: Isolation 是该池统一的隔离级别。
+                enum:
+                - simulated
+                - runc
+                - kata-fc
+                - kata-clh
+                type: string
+              nodePoolSelector:
+                additionalProperties:
+                  type: string
+                description: NodePoolSelector 把池绑定到节点池（由 Karpenter/CA 维护）。
+                type: object
+              priorityBands:
+                items:
+                  description: |-
+                    PriorityBand 把一个优先级类别限定到一定的库存份额。
+
+                    注意：跨 band 的"抢占"实际是"回收 + 重建"（Pod 的 PriorityClass 不可变），
+                    代价约 1.5–2.5s。因此 band 划分必须靠预测，而不是靠抢占来临时调剂。
+                  properties:
+                    className:
+                      minLength: 1
+                      type: string
+                    minWarmSharePermille:
+                      description: MinWarmSharePermille 是该 band 的最小库存份额（千分比，700 =
+                        70%）。
+                      format: int32
+                      maximum: 1000
+                      minimum: 0
+                      type: integer
+                  required:
+                  - className
+                  type: object
+                maxItems: 4
+                type: array
+              scaling:
+                description: |-
+                  SandboxPoolScaling 是池水位策略。
+
+                  算法与推导见 docs/05 §3：前馈（EWMA + 趋势）+ 反馈（命中率缺口）
+                properties:
+                  dampening:
+                    description: Dampening 是防抖参数。这是池化最容易翻车的地方（docs/05 §3.4）。
+                    properties:
+                      ewmaAlphaPermille:
+                        default: 300
+                        description: EWMAAlphaPermille 是需求预测的平滑系数（千分比），越小越平滑。
+                        format: int32
+                        maximum: 1000
+                        minimum: 50
+                        type: integer
+                      hysteresisRatioPermille:
+                        default: 100
+                        description: |-
+                          HysteresisRatioPermille 是滞回带宽度（千分比）：只有偏离目标超过该比例才动作，
+                          避免水位在目标附近反复进出。
+                        format: int32
+                        maximum: 500
+                        minimum: 0
+                        type: integer
+                      scaleDownCooldownSeconds:
+                        default: 180
+                        description: ScaleDownCooldownSeconds 故意远大于扩容冷却（保守优先）。
+                        format: int32
+                        minimum: 0
+                        type: integer
+                      scaleUpCooldownSeconds:
+                        default: 15
+                        description: ScaleUpCooldownSeconds 应显著小于缩容冷却：扩容要快，缩容要慢。
+                        format: int32
+                        minimum: 0
+                        type: integer
+                    type: object
+                  maxProvisionPerSecond:
+                    default: 50
+                    description: |-
+                      MaxProvisionPerSecond / MaxReclaimPerSecond 是扩缩限速，
+                      保护 API Server 与 CNI 不被批量操作打爆。
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxReclaimPerSecond:
+                    default: 30
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxWarm:
+                    default: 100
+                    description: MaxWarm 是上限，防止池失控烧钱。
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  minWarm:
+                    default: 2
+                    description: MinWarm 是低峰保底库存：保证低峰也走热路径。
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  pauseScaling:
+                    default: false
+                    description: PauseScaling 是运维熔断开关：冻结所有自动扩缩，便于排障。
+                    type: boolean
+                  replenishSeconds:
+                    default: 90
+                    description: |-
+                      ReplenishSeconds 是"决定扩容 → 库存 Ready"的实测补货时间。
+                      这是安全库存公式里最敏感的参数：平方根关系意味着补货时间减半、所需缓冲减少近半。
+                      主导项是"节点是否已就绪 + L1 镜像是否已预热"，因此该值必须来自实测而非估计。
+                    format: int32
+                    minimum: 5
+                    type: integer
+                  targetHitRatioPermille:
+                    default: 900
+                    description: |-
+                      TargetHitRatioPermille 是命中率目标，以千分比表示（900 = 90%）。
+
+                      用整数千分比而不是 float：Kubernetes API 约定要求避免浮点数
+                      （不同语言与中间层对 JSON number 的表示不一致），而且控制回路参数
+                      用整数才能保证单测与 A/B 对比可精确复现。
+                    format: int32
+                    maximum: 999
+                    minimum: 500
+                    type: integer
+                  targetWarmBuffer:
+                    default: 10
+                    description: TargetWarmBuffer 是在预测需求之外额外维持的库存缓冲。
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              stockPolicy:
+                description: StockPolicy 是库存健康策略。
+                properties:
+                  maxStockAgeSeconds:
+                    default: 3600
+                    description: |-
+                      MaxStockAgeSeconds 是库存最长未认领时间，超过则轮换销毁，
+                      避免镜像过期与长驻实例的内存缓慢增长累积。
+                    format: int32
+                    minimum: 60
+                    type: integer
+                  stockReadyTimeoutSeconds:
+                    default: 120
+                    description: StockReadyTimeoutSeconds 是库存就绪超时（对应 Provisioning
+                      阶段超时）。
+                    format: int32
+                    minimum: 10
+                    type: integer
+                type: object
+              templateRef:
+                description: TemplateRef 是该池的默认规格模板（集群级对象）。
+                properties:
+                  name:
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              tier:
+                description: Tier 是该池统一的资源档位。
+                enum:
+                - tiny
+                - small
+                - medium
+                - large
+                type: string
+            required:
+            - isolation
+            - templateRef
+            - tier
+            type: object
+          status:
+            description: SandboxPoolStatus 是池水位与决策的观测状态。
+            properties:
+              claimLatencyP95Ms:
+                format: int64
+                type: integer
+              claimed:
+                description: Claimed 是已认领数。
+                format: int32
+                type: integer
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              draining:
+                description: Draining 是被标记排空、已从水位统计中排除的库存数。
+                format: int32
+                type: integer
+              failed:
+                format: int32
+                type: integer
+              hitRatio1hPermille:
+                description: HitRatio1hPermille 是 1 小时滑动窗口的热路径命中率，千分比。
+                format: int32
+                type: integer
+              inflight:
+                description: Inflight 是正在创建（Pending/Provisioning）的库存数，用于避免重复扩容决策。
+                format: int32
+                type: integer
+              lastScaleDecision:
+                description: LastScaleDecision 记录最近一次扩缩决策，用于排查振荡。
+                properties:
+                  at:
+                    format: date-time
+                    type: string
+                  delta:
+                    format: int32
+                    type: integer
+                  reason:
+                    description: Reason 必须是枚举化的字符串，避免指标基数爆炸。
+                    type: string
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              predictedDemand:
+                format: int32
+                type: integer
+              saturationPermille:
+                description: SaturationPermille 是饱和度 claimed/(warm+claimed)，千分比。
+                format: int32
+                type: integer
+              target:
+                format: int32
+                type: integer
+              warm:
+                description: Warm 是未认领且 Ready 的库存数 —— 池水位的唯一定义来源。
+                format: int32
+                type: integer
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
