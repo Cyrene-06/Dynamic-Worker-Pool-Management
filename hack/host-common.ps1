@@ -78,6 +78,14 @@ function Test-ServiceRegistered {
 #
 # The parameter is deliberately NOT named $Args: PowerShell variables are case
 # insensitive, so that name would shadow the automatic $args variable.
+#
+# WorkingDirectory is not decoration either. Start-Job creates a fresh runspace,
+# and that runspace does NOT inherit the caller's location -- native commands
+# launched from it start in the process's original directory instead. Found the
+# hard way: `kubectl apply -k config/crd` inside a job resolved the path against
+# C:\Users\<user>\Documents, which reported "not a valid directory" for a path
+# that plainly exists. Every relative path in the calling scripts depended on
+# this, so it is fixed here rather than worked around in each caller.
 function Invoke-Native {
     param(
         [string]$Exe,
@@ -92,11 +100,14 @@ function Invoke-Native {
         # page (GBK on a zh-CN machine), which turns a readable Chinese error
         # message into mojibake.
         [ValidateSet('default', 'utf8', 'unicode')]
-        [string]$OutputEncoding = 'default'
+        [string]$OutputEncoding = 'default',
+        [string]$WorkingDirectory = ''
     )
+    if (-not $WorkingDirectory) { $WorkingDirectory = (Get-Location).ProviderPath }
     $job = Start-Job -ScriptBlock {
-        param($e, $a, $enc)
+        param($e, $a, $enc, $wd)
         try {
+            if ($wd) { Set-Location -LiteralPath $wd -ErrorAction SilentlyContinue }
             if ($enc -eq 'utf8') {
                 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
             } elseif ($enc -eq 'unicode') {
@@ -113,7 +124,7 @@ function Invoke-Native {
         } catch {
             @{ Exit = -1; Text = $_.Exception.Message }
         }
-    } -ArgumentList $Exe, $ArgList, $OutputEncoding
+    } -ArgumentList $Exe, $ArgList, $OutputEncoding, $WorkingDirectory
     if (Wait-Job $job -Timeout $TimeoutSeconds) {
         $result = Receive-Job $job
         Remove-Job $job -Force
