@@ -260,9 +260,9 @@ make sweeper-local
 | 接入层全部路由与错误语义 | ✅ httptest + envtest（真实 API Server） | — |
 | 泄漏对账的判断逻辑 | ✅ 纯函数穷举测试 | — |
 | 运营商清单（gateway / sweeper） | ⚠️ 仅用 `kubectl kustomize` 渲染验证过 | 一个真集群 + 镜像 |
-| 容器镜像（`Dockerfile`） | ⚠️ 已写好（多阶段 + distroless + 多架构），但**未真正构建过** | 可用的容器运行时（本机 Docker Desktop 已装，但 Linux 引擎未初始化） |
-| Operator 的 Deployment 清单（`config/manager`） | ⚠️ 仅渲染验证过；PVC 权限与缓存作用域已对齐 | 在真集群验证 leader election / 探针 / 卷回收 |
-| kind 端到端（申请→认领→回收全链） | ❌ 未跑通 | 同上 |
+| 容器镜像（`Dockerfile`） | ⚠️ 已写好（多阶段 + distroless + 多架构），但**未真正构建过** | 可用的容器运行时。本机的具体阻塞点已定位到 Windows 侧：`VirtualMachinePlatform` 未启用（见 §2.8 的宿主修复步骤） |
+| Operator 的 Deployment 清单（`config/manager`） | ⚠️ 仅渲染验证过；PVC 权限与缓存作用域已对齐 | 在真集群验证 leader election / 探针 / 卷回收（`hack/kind-e2e.ps1` 已把这三项写成可执行断言，但**尚未执行过**） |
+| kind 端到端（申请→认领→回收全链） | ❌ 未跑通 | 同上。脚本已就绪（`hack/kind-e2e.ps1`），差的是一个能跑 Linux 容器的宿主 |
 | Kata / Firecracker 真实隔离、启动延迟、cgroup 冻结 | ❌ 本机物理上做不到 | 带 `/dev/kvm` 的 Linux 节点（本机无 KVM） |
 | 接入令牌的**强制** | ❌ 数据面代理尚未实现 | 一个校验令牌的连接代理；在那之前它只是一份凭据，不是一道防线 |
 | 状态落盘（L3） | ❌ 默认 `DisabledFlusher`，启用 externalize 时会**明确报错** | 对象存储接入（M2） |
@@ -336,17 +336,30 @@ kubectl apply -k config/sweeper
 > 要么配镜像加速，要么删掉该行与 `--mount=type=cache` 参数回退经典构建器。
 >
 > ⚠️ 三件事当前还做不到，不要把它们读成已完成：
-> 一是本机容器运行时不可用（`docker info` **会挂住而非快速失败**），所以上面的构建命令
+> 一是本机容器运行时不可用 —— 具体阻塞点已定位到 Windows 侧（`VirtualMachinePlatform`
+> 未启用，且一次“已重启但仍然没生效”的 CBS 延迟启动处理），所以上面的构建命令
 > **尚未在真实环境里跑过一次**；
 > 二是 `config/manager/`（Operator 的 Deployment）已写好，同样**只在渲染层面验证过**；
 > 三是“以 Pod 里的 ServiceAccount 跑通”这件事还没做过 —— 而很多缺口只会在那种情况下暴露：
 > 例如曾经漏掉的 PVC 权限（现已补齐：`config/rbac/operator-sandbox-namespace.yaml`
 > 的 namespaced Role + `cmd/operator/main.go` 收窄的缓存），
 > 本地用开发者 kubeconfig（通常是 cluster-admin）跑**永远看不见**（docs/10 R17）。
+> `hack/kind-e2e.ps1` 的 verify 阶段已把这条写成了断言：它以 Pod 的 ServiceAccount 身份
+> 逐条查 `kubectl auth can-i`，**并断言它“不能”做的那些事**（跨命名空间删 PVC、读 Secret、
+> exec 进沙箱），再回读 Operator 日志里有没有 `forbidden`。
 >
-> 容器运行时本身出问题时，先跑 `powershell -ExecutionPolicy Bypass -File hack/docker-doctor.ps1`：
-> 它逐层报告 CLI / 守护进程 / Docker Desktop 服务 / WSL / 虚拟化的状态，并打印需要
-> **管理员权限**的修复步骤（脚本自身只读、不提权）。
+> **Windows（没有 make）**：仓库里另外三个脚本是同一套流程的 PowerShell 实现，
+> 因为“命令写在跑不了的 Makefile 里”正是一个又一个勾选不上里程碑的成因 ——
+> `hack/docker-doctor.ps1`（只读诊断）、`hack/host-ready.ps1`（宿主修复，需管理员）、
+> `hack/kind-e2e.ps1`（等价于本节的构建/加载/部署/校验全流程）。
+> 三者共享 `hack/host-common.ps1`——共享的理由和三个镜像共用一个 Dockerfile 一样：
+> 一处修复不应该需要记得改三遍。
+>
+> 宿主本身出问题时按这个顺序走：先跑 `hack/docker-doctor.ps1` 看**哪一层**坏了
+> （逐层报告 CLI / 守护进程 / Docker Desktop 服务 / WSL / 虚拟化 / Windows 服务栈），
+> 再用**管理员** PowerShell 跑 `hack/host-ready.ps1 -Mode repair`，它会按缺什么补什么
+> （补功能、关快速启动、把 TrustedInstaller 设回自动），并告诉你什么时候必须重启。
+> 诊断脚本自身只读、不提权。
 
 ## 3. 技术选型
 
@@ -460,7 +473,11 @@ stateDiagram-v2
 │   ├── kind-config.yaml          # E1 集群配置
 │   ├── smoke/                    # Kata / 网络策略冒烟用例
 │   ├── bootstrap/                # 节点初始化与 KVM/vsock 自检
-│   └── verify.ps1                # Windows 验证入口
+│   ├── verify.ps1                # Windows 验证入口（等价于 make verify）
+│   ├── docker-doctor.ps1         # 只读诊断：容器运行时为什么起不来（逐层）
+│   ├── host-ready.ps1            # 管理者侧修复：把 Windows 补到能跑 Linux 容器
+│   ├── kind-e2e.ps1              # Windows 版 kind 端到端 + 选主切换 + RBAC 审计
+│   └── host-common.ps1           # 上述三个脚本共享的辅助函数（被 dot-source）
 ├── test/envtest/                 # 进程内控制面（etcd + kube-apiserver），不需要 Docker
 ├── docs/                         # 设计文档 01–10
 ├── Makefile                      # Linux / CI 验证与镜像构建入口

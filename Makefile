@@ -130,9 +130,13 @@ test-envtest: envtest-assets ## 跑需要真实 API Server 的测试（CAS 认�
 # （理由见 Dockerfile 头注释：避免"升级 Go 版本要改三处"）。
 # 需要 BuildKit（Docker 23+ 默认开启），因为用到了 cache mount。
 #
-# 注意：本机（Windows）当前 Docker 守护进程不可用 —— Docker Desktop 已安装但
-# Linux 引擎未初始化。因此这些目标**尚未被真正执行过**，第一次跑之前请先确认
-# `docker info` 有输出（README §2.6 有完整说明）。
+# 注意：本机（Windows）当前 Docker 守护进程不可用，因此这些目标**尚未被真正执行过**。
+# 阻塞点不在 Dockerfile，而在 Windows 侧（VirtualMachinePlatform 未启用；并且发过
+# 启用请求、机器重启过，CBS 却在启动时延迟了启动处理，所以“需要重启”不等于“生效”）。
+# 先诊断再用管理员修复，不要把重启当作万能下一步：
+#   powershell -ExecutionPolicy Bypass -File hack/docker-doctor.ps1
+#   powershell -ExecutionPolicy Bypass -File hack/host-ready.ps1 -Mode repair
+# 第一次跑构建前请确认 `docker info` 有输出（README §2.6 / §2.8 有完整说明）。
 .PHONY: docker-build
 docker-build: ## 构建三个镜像（本地架构：operator / gateway / sweeper）
 	docker build $(DOCKER_BUILD_ARGS) --build-arg BINARY=operator -t $(OPERATOR_IMAGE) .
@@ -182,6 +186,10 @@ kind-load: ## 把三个镜像加载进 kind 集群（不需要 registry）
 
 # 一条命令跑完 E1 端到端（docs/10 M1 的退出标准：“以容器方式在 kind 上跑通，
 # 且用 Pod 里的 ServiceAccount 而不是开发者的 kubeconfig”）。
+#
+# Windows 上没有 make，用 hack/kind-e2e.ps1 —— 它是同一套流程的 PowerShell 实现，
+# 并且把两条退出标准写成了断言（选主切换；以 Pod 的 ServiceAccount 身份逐条查
+# kubectl auth can-i，并断言它“不能”做的那些事）。
 #
 # 顺序不能变：
 #   config/samples 必须先于 config/rbac —— 它负责创建 sandbox-pool / sandbox-system

@@ -53,8 +53,9 @@ gantt
 | Finalizer 链 + 泄漏对账 | 5 个 Finalizer + Sweeper CronJob |
 | `sandbox-gateway` | REST API、鉴权、配额、幂等键、错误语义 |
 | 保护模式 | 雪崩保护（[05 §5](05-warm-pool-and-scaling.md)）：失败率触发 + 滞回 + 扩容限速 + 接入层拒绝低优。**边界：API 延迟判据与高优排队未接线**（见 05 §5 实现状态表） |
-| 容器镜像 | 三个组件共用一个多阶段 `Dockerfile`（distroless 运行时、多架构）；**尚未在可用运行时上构建过** |
-| 控制面部署清单 | `config/manager/`（Deployment + 指标 Service + PDB，含 leader election 与探针）；**仅渲染验证，且待补 PVC 权限** |
+| 容器镜像 | 三个组件共用一个多阶段 `Dockerfile`（distroless 运行时、多架构）；**尚未在可用运行时上构建过**（本机阻塞点已定位到 Windows 侧的 `VirtualMachinePlatform`，不是 Dockerfile 本身） |
+| 控制面部署清单 | `config/manager/`（Deployment + 指标 Service + PDB，含 leader election 与探针）；**仅渲染验证**；PVC 权限与缓存作用域已对齐 |
+| 端到端验证入口 | `hack/kind-e2e.ps1`（Windows 版；等价于 `make kind-e2e`，并把选主切换与 RBAC 审计写成断言）；**已写好，尚未执行过** |
 
 **退出标准**：
 - [ ] 在 kind 上模拟 200 创建/秒，**命中率 > 90%**，无泄漏（对账指标 0）
@@ -67,7 +68,19 @@ gantt
 - [ ] `sandbox-operator` **以容器方式**在 kind 上跑通（含 leader election 切换）—— 判据必须是
       “Pod 里的 ServiceAccount”而不是“开发者 kubeconfig”：后者是 cluster-admin，会把
       RBAC 缺口全部掩盖掉（见 R17）
-
+> **上面前四个勾选框的前提是一条环境依赖**：以上全部要求一个能跑 Linux 容器的宿主。
+> 本机在这条上卡了很久，而且症状极具误导性 —— 看上去像“Docker 坏了”或“DISM 坏了”，
+> 实际是三层叠在一起的：
+>   1. `VirtualMachinePlatform` 未启用（Windows 家庭版没有 Hyper-V，WSL2 后端是唯一选项）；
+>   2. 启用请求发出后机器确实重启了，但 CBS 在启动时 **延迟了启动处理**
+>      （`Startup: Deferring startup processing at users request`）—— 于是“需要重启”
+>      并不等于“这次重启会生效”；
+>   3. 快速启动（hiberboot）默认开启，它把“关机再开机”变成一次**恢复**而非启动，
+>      这正是延迟服务处理最常见的前提。
+> 结论：入口脚本先诊断再用**管理员**修复，不要把重启当作万能下一步 ——
+> `hack/docker-doctor.ps1`（只读，逐层报告）→ `hack/host-ready.ps1 -Mode repair`
+> （按缺什么补什么，并明确告诉你何时必须重启）；镜像构建与 kind 端到端由
+> `hack/kind-e2e.ps1` 一次性跑完。
 **风险**：池振荡（最高概率的翻车点）。**缓解**：先以静态水位（`minWarm` 恒定）上线，通过后再逐项打开预测与阻尼参数。
 
 ### M2 · 隔离与运行时（4 周）

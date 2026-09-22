@@ -33,79 +33,13 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$script:failed = 0
-$script:warned = 0
-
-function Write-Head {
-    param([string]$Text)
-    Write-Host ''
-    Write-Host "=== $Text ===" -ForegroundColor Cyan
-}
-
-function Write-OK   { param([string]$t) Write-Host "[ OK ] $t"   -ForegroundColor Green }
-function Write-Warn { param([string]$t) Write-Host "[WARN] $t"   -ForegroundColor Yellow; $script:warned++ }
-function Write-Bad  { param([string]$t) Write-Host "[FAIL] $t"   -ForegroundColor Red;    $script:failed++ }
-function Write-Info { param([string]$t) Write-Host "       $t" }
-
-# Invoke-Native: run an external command with a HARD TIMEOUT and return merged
-# output plus the exit code.
-#
-# Why the timeout is not optional: when the Docker named pipe exists but the
-# Linux engine is dead, `docker info` does not fail fast -- it blocks. A doctor
-# script that hangs while diagnosing a hang is worse than useless, so every
-# external call here runs in a job and is abandoned after $TimeoutSeconds.
-# (Stop-Job tears down the runspace; the orphaned child process is expected to
-# exit on its own once the pipe errors out. That is an acceptable trade for
-# guaranteeing this script always terminates.)
-#
-# The parameter is deliberately NOT named $Args: PowerShell variables are case
-# insensitive, so that name would shadow the automatic $args variable.
-function Invoke-Native {
-    param(
-        [string]$Exe,
-        [string[]]$ArgList,
-        [int]$TimeoutSeconds = 20,
-        # Native tools do NOT all speak the same encoding, and getting this wrong
-        # corrupts exactly the line you need to read:
-        #   wsl.exe  -> UTF-16LE
-        #   docker   -> UTF-8
-        #   whoami   -> the console code page
-        # PowerShell 5.1 otherwise decodes native stdout using the console code
-        # page (GBK on a zh-CN machine), which turns a readable Chinese error
-        # message into mojibake.
-        [ValidateSet('default', 'utf8', 'unicode')]
-        [string]$OutputEncoding = 'default'
-    )
-    $job = Start-Job -ScriptBlock {
-        param($e, $a, $enc)
-        try {
-            if ($enc -eq 'utf8') {
-                [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-            } elseif ($enc -eq 'unicode') {
-                [Console]::OutputEncoding = [System.Text.Encoding]::Unicode
-            }
-            # ForEach-Object { "$_" } matters: piping native stderr into Out-String
-            # would render ErrorRecords with the whole "CategoryInfo /
-            # NativeCommandError / FullyQualifiedErrorId" block, burying the one
-            # line that actually explains the failure. The RemoteException filter
-            # drops the bare type name PowerShell tacks onto wrapped stderr records.
-            $out = (& $e @a 2>&1 | ForEach-Object { "$_" } |
-                Where-Object { $_ -notmatch '^System\.Management\.Automation\.\w+$' }) -join "`n"
-            @{ Exit = $LASTEXITCODE; Text = $out.Trim() }
-        } catch {
-            @{ Exit = -1; Text = $_.Exception.Message }
-        }
-    } -ArgumentList $Exe, $ArgList, $OutputEncoding
-    if (Wait-Job $job -Timeout $TimeoutSeconds) {
-        $result = Receive-Job $job
-        Remove-Job $job -Force
-        if ($null -eq $result) { return @{ Exit = -1; Text = '' } }
-        return $result
-    }
-    Stop-Job $job -ErrorAction SilentlyContinue
-    Remove-Job $job -Force -ErrorAction SilentlyContinue
-    return @{ Exit = 124; Text = "timed out after ${TimeoutSeconds}s" }
-}
+# Shared with hack/host-ready.ps1 and hack/kind-e2e.ps1: the coloured writers
+# (Write-Head / Write-OK / Write-Warn / Write-Bad / Write-Info), Test-Elevated,
+# Get-FeatureState and Invoke-Native -- the native-command runner that cannot
+# hang. One copy on purpose: a fix to the timeout or to the stderr filtering
+# must not have to be remembered in three files, and this doctor is only useful
+# if its view of the machine matches the repair script's view of it.
+. (Join-Path $PSScriptRoot 'host-common.ps1')
 
 $daemonReachable = $false
 
@@ -327,7 +261,82 @@ if ((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).Hypervi
 }
 
 # ---------------------------------------------------------------------------
-Write-Head '7. Group membership'
+Write-Head '7. Windows servicing (why a reboot can fail to apply a change)'
+# This section exists because on this machine a reboot did NOT fix it.
+#
+# The sequence: DISM was asked to enable VirtualMachinePlatform, it answered
+# "Reboot required=yes", the machine was rebooted -- and the feature was still
+# absent. None of that is visible from the outside. The only record is
+# C:\Windows\Logs\CBS\CBS.log:
+#     Startup: Deferring startup processing at users request
+#     Aborted processing startup actions, requiring shutdown processing and
+#     will try startup processing again in the future.
+# "The reboot did not apply it" is therefore a real, nameable state, and this
+# section names it, instead of letting the reader conclude DISM is broken.
+#
+# Four signals, all readable WITHOUT elevation:
+#   - the CBS state of the VirtualMachinePlatform payload. 0x60 means
+#     "install requested" -- an install that a reboot was supposed to apply.
+#     Still 0x60 after a reboot = that reboot did not take.
+#   - the CBS RebootPending marker.
+#   - TrustedInstaller's start type. If it is not Automatic, CBS logs "No startup
+#     processing required" and the pending work waits forever.
+#   - fast startup. With it on, "shut down" + power on is a RESUME, not a boot,
+#     and pending servicing has no startup path to run on.
+$vmp = Get-CbsPackageState 'Microsoft-Windows-HyperV-OptionalFeature-VirtualMachinePlatform-Client-Package~*~amd64~~*'
+if ($null -eq $vmp) {
+    Write-Warn 'no CBS payload entry found for VirtualMachinePlatform.'
+} else {
+    $stateText = Format-CbsState $vmp.State
+    if ($vmp.State -eq 0x60) {
+        Write-Warn "VirtualMachinePlatform payload: $stateText"
+        Write-Info 'If the machine has already been rebooted since DISM said "reboot required",'
+        Write-Info 'then that reboot did NOT apply it (see step 1 of the fix sequence below).'
+        $script:servicingStuck = $true
+    } elseif ($vmp.State -eq 0x70) {
+        Write-OK "VirtualMachinePlatform payload: $stateText"
+    } else {
+        Write-Info "VirtualMachinePlatform payload: $stateText"
+    }
+}
+
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') {
+    Write-Warn 'CBS still has a pending reboot marker.'
+    $script:rebootPending = $true
+}
+
+$tiStart = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\TrustedInstaller' -Name Start -ErrorAction SilentlyContinue).Start
+if ($null -eq $tiStart) {
+    Write-Warn 'the TrustedInstaller service is not registered (unusual).'
+} elseif ($tiStart -eq 2) {
+    Write-OK 'TrustedInstaller start type is Automatic: CBS runs startup processing at boot.'
+} else {
+    Write-Bad "TrustedInstaller start type is $tiStart (2 = Automatic): pending servicing will never run."
+}
+
+$hiberboot = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name HiberbootEnabled -ErrorAction SilentlyContinue).HiberbootEnabled
+if ($hiberboot -eq 1) {
+    Write-Warn 'fast startup is ON: "shut down" + power on is a resume, not a boot.'
+    Write-Info 'After asking Windows to enable a feature, use Restart (or "shutdown /r").'
+}
+
+$cbsLog = Join-Path $env:WINDIR 'Logs\CBS\CBS.log'
+if (Test-Path $cbsLog) {
+    $defer = Get-Content $cbsLog -ErrorAction SilentlyContinue |
+        Select-String -Pattern 'Deferring startup processing' | Select-Object -Last 1
+    if ($defer) {
+        Write-Warn 'CBS deferred startup processing at the last startup:'
+        Write-Info ('  ' + $defer.Line.Trim())
+        $script:servicingStuck = $true
+    } else {
+        Write-OK 'CBS never deferred startup processing in the current log.'
+    }
+} else {
+    Write-Info "CBS log not readable: $cbsLog"
+}
+
+# ---------------------------------------------------------------------------
+Write-Head '8. Group membership'
 # Missing docker-users shows up as "access denied" on the named pipe rather than
 # as an obvious permission error, so it is worth stating explicitly.
 $groups = Invoke-Native whoami @('/groups')
@@ -363,15 +372,32 @@ $step = 1
 # VirtualMachinePlatform feature had gone back to 'not installed' (InstallState=1),
 # so the reboot could not possibly have helped. Check the feature state first.
 if ($script:featuresMissing) {
-    Write-Host "  $step. Enable the missing Windows features (ADMIN PowerShell), then REBOOT." -ForegroundColor Cyan
+    Write-Host "  $step. Enable the missing Windows features (ADMIN), then RESTART." -ForegroundColor Cyan
     Write-Host '     Without VirtualMachinePlatform there is no hns/vmcompute, no running'
     Write-Host '     hypervisor, and therefore no WSL2 distro and no Docker engine --'
-    Write-Host '     the WSL runtime being installed is NOT enough on its own:'
+    Write-Host '     the WSL runtime being installed is NOT enough on its own.'
+    Write-Host '     Easiest: one script does this whole step set (re-arm the request, turn'
+    Write-Host '     fast startup off, put TrustedInstaller back to automatic, then tell you'
+    Write-Host '     to restart):'
+    Write-Host '       powershell -ExecutionPolicy Bypass -File hack/host-ready.ps1 -Mode repair'
+    Write-Host '     By hand it is:'
     Write-Host '       DISM /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart'
     Write-Host '       DISM /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart'
-    Write-Host '     Then reboot (a reboot is the only way a feature change takes effect).'
-    Write-Host '     Optional sanity check of the real servicing state (admin):'
-    Write-Host '       DISM /online /get-featureinfo /featurename:VirtualMachinePlatform'
+    Write-Host '     Then RESTART -- never "shut down" + power on, which may be a resume'
+    Write-Host '     of a hibernated session and applies nothing:'
+    Write-Host '       shutdown /r /t 0'
+    if ($script:servicingStuck) {
+        Write-Host ''
+        Write-Host '     NOTE: a reboot has already failed to apply this once (section 7).' -ForegroundColor Yellow
+        Write-Host '     That is not a reason to give up and it is not "DISM is broken": a'
+        Write-Host '     deferred servicing operation is retried at the next boot. Re-run the'
+        Write-Host '     enable command above (it re-arms the request) and restart again.'
+        Write-Host '     If a SECOND restart still leaves it pending, the servicing stack is'
+        Write-Host '     the suspect. Check Windows Update for a staged update first (a staged'
+        Write-Host '     cumulative update and a feature request can block each other), then:'
+        Write-Host '       DISM /online /cleanup-image /restorehealth     (ELEVATED)'
+        Write-Host '       sfc /scannow                                    (ELEVATED)'
+    }
     Write-Host ''
     $step++
 } elseif ($script:rebootPending) {
@@ -401,9 +427,14 @@ if ($script:wslRuntimeMissing) {
     $step++
 }
 
-Write-Host "  $step. Start Docker Desktop once, as administrator, and wait until it" -ForegroundColor Cyan
-Write-Host '     reports "Docker Desktop is running". The first start creates the'
-Write-Host '     docker-desktop distro and registers com.docker.service.'
+Write-Host "  $step. Start Docker Desktop once, as the NORMAL user (NOT elevated), and" -ForegroundColor Cyan
+Write-Host '     wait until it reports "Docker Desktop is running". Its first start'
+Write-Host '     creates the docker-desktop distro and registers com.docker.service.'
+Write-Host '     Deliberately not "as administrator": Docker Desktop keeps per-user'
+Write-Host '     state (settings-store.json, the WSL distro, the named pipes) and an'
+Write-Host '     elevated start produces a second, differently-owned set of them, which'
+Write-Host '     then looks like "the engine is up but the CLI cannot reach it".'
+Write-Host '     This is the one step hack/host-ready.ps1 will not do for you.'
 Write-Host ''
 $step++
 
@@ -411,8 +442,14 @@ Write-Host "  $step. Verify (this order tells you WHICH layer is still broken):"
 Write-Host '       wsl --status'
 Write-Host '       wsl --list --verbose'
 Write-Host '       docker info          # must not hang; re-run this script if it does'
+Write-Host '     Then, once the daemon answers, the two commands that were never'
+Write-Host '     executable on this machine:'
+Write-Host '       make docker-build'
+Write-Host '       powershell -ExecutionPolicy Bypass -File hack/kind-e2e.ps1 -Stage cluster,image,load,deploy,verify'
 Write-Host ''
 Write-Host '  Notes:'
+Write-Host '    - hack/host-ready.ps1 walks these same steps and applies them; this'
+Write-Host '      script only reports. Run the doctor first, the repair script second.'
 Write-Host '    - On Windows Home there is no Hyper-V: the WSL2 backend is the only option.'
 Write-Host '    - "wsl.exe exists" never means "WSL is installed" -- every modern Windows'
 Write-Host '      ships it as an installer stub.'
