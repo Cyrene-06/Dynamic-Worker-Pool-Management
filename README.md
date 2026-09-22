@@ -5,15 +5,15 @@
 </div>
 
 <div align="center">
-  <img src="https://img.shields.io/badge/kubernetes-1.30%2B-blue" alt="kubernetes" />
-  <img src="https://img.shields.io/badge/go-1.23%2B-00ADD8" alt="go" />
-  <img src="https://img.shields.io/badge/controller--runtime-v0.19-lightBlue" alt="controller-runtime" />
+  <img src="https://img.shields.io/badge/kubernetes-1.32%2B-blue" alt="kubernetes" />
+  <img src="https://img.shields.io/badge/go-1.27%2B-00ADD8" alt="go" />
+  <img src="https://img.shields.io/badge/controller--runtime-v0.25.1-lightBlue" alt="controller-runtime" />
   <img src="https://img.shields.io/badge/kata--containers-3.4-orange" alt="kata-containers" />
   <img src="https://img.shields.io/badge/firecracker-1.7-purple" alt="firecracker" />
   <img src="https://img.shields.io/badge/cilium-1.16-green" alt="cilium" />
   <img src="https://img.shields.io/badge/karpenter-v1-yellow" alt="karpenter" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license" />
-  <img src="https://img.shields.io/badge/status-设计阶段-inactive" alt="status" />
+  <img src="https://img.shields.io/badge/status-M0%20骨架-yellow" alt="status" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome" />
 </div>
 
@@ -78,7 +78,7 @@ flowchart LR
 
 ## 重要提示
 
-1. **当前处于设计阶段**：仓库内容为架构设计与技术选型分析，**暂不含可运行的实现代码**。文中出现的命令、CRD、配置均为目标形态，将随里程碑逐步落地。
+1. **当前处于 M0 骨架阶段**：已落地 CRD 定义、隔离抽象层、状态机与控制器骨架（`internal/controller` 的 `NextPhase` 是纯函数，21 个单测全绿）。**尚未实现**：`PoolController`、`sandbox-gateway`、Pod 之外的资源清理（M1）。隔离验证仍需带 `/dev/kvm` 的环境。
 2. 阅读或实践本项目需要一定的 **Kubernetes Operator 开发（Go）** 与 **容器运行时** 基础。
 3. 主隔离方案 Kata Containers + Firecracker 要求节点具备 `/dev/kvm`（裸金属或支持嵌套虚拟化的实例）；**本地 kind 环境无法真实验证隔离**，只能用 `simulated` 模式验证控制逻辑。
 4. 文档中所有性能数字均为**量级参考**，必须以本项目的压测基线校正后才能写入 SLO。
@@ -127,23 +127,30 @@ Hi! 首先感谢你关注本项目。
 - containerd >= **1.7**（如需真实隔离，节点需具备 `/dev/kvm` 与 `vhost_vsock`）
 - IDE 推荐：**VS Code**（`Go` + `Kubernetes` 扩展）或 **Goland**
 
-### 2.1 控制面 Operator（随 M0/M1 里程碑提供）
+### 2.1 控制面 Operator
 
 ```bash
 # 克隆项目
 git clone https://github.com/Cyrene-06/Dynamic-Worker-Pool-Management.git
 cd Dynamic-Worker-Pool-Management
 
-# 生成 CRD / RBAC 清单与 DeepCopy
+# 生成 CRD / RBAC 清单与 DeepCopy（改了 api/ 下的类型后必跑）
 make manifests generate
 
-# 单元测试（envtest，无需 KVM，可在本地与 CI 无特权环境运行）
+# 单元测试：纯函数 + 隔离抽象层，不需要集群、不需要 KVM
 make test
 
-# 部署到当前 kubeconfig 指向的集群
+# 完整验证（格式 + vet + 构建 + 测试）—— 提交前跑这一条就够
+make verify
+
+# 安装 CRD 并把 Operator 跑起来（本地 simulated 隔离）
 make install
-make deploy OVERLAY=local
+make deploy-local
 ```
+
+> Windows 上没有 make 时，用等价入口：
+> `powershell -ExecutionPolicy Bypass -File hack/verify.ps1`
+> （支持 `-Task verify|fmt|vet|build|test|manifests|generate`）
 
 ### 2.2 本地开发集群（kind）
 
@@ -151,16 +158,16 @@ make deploy OVERLAY=local
 # 创建集群
 kind create cluster --config hack/kind-config.yaml
 
-# 安装 CNI 与证书管理器
-helm install cilium cilium/cilium -n kube-system --set kubeProxyReplacement=true
-helm install cert-manager jetstack/cert-manager -n cert-manager --set installCRDs=true
+# 应用示例命名空间 / 模板 / 池 / 沙箱（simulated 隔离，回落 runc）
+kubectl apply -k config/samples
 
-# 应用示例模板与沙箱池（simulated 隔离，回落 runc）
-kubectl apply -k config/samples/local
-
-# 端到端冒烟测试
-make e2e-local
+# 观察状态机推进（Ready = 池中库存，Running = 已售出）
+kubectl get agentsandbox -n sandbox-pool -w
 ```
+
+> E1 默认保留 kind 自带的 kindnet，**不需要先装 Cilium** —— 它的目的是验证控制面逻辑。
+> 出口白名单（`CiliumNetworkPolicy`）的验证放在 E2/E3，见 [docs/06 §7.2](docs/06-isolation-runtime.md)。
+> 本地集群**无法**验证隔离强度与启动延迟，这两项必须去带 `/dev/kvm` 的环境。
 
 ### 2.3 CRD 与 API 参考
 
@@ -196,7 +203,7 @@ kubectl exec -it kata-smoke -- uname -r
 
 ### 2.5 VSCode 工作区
 
-- **开发**：使用 `VSCode` 打开仓库根目录，`Go` 扩展会自动加载 `go.work`/`go.mod`；`config/overlays/*` 提供多环境清单。
+- **开发**：使用 `VSCode` 打开仓库根目录，`Go` 扩展会自动加载 `go.mod`；`config/` 下是 Kustomize 清单（`crd` / `isolation` / `rbac` / `samples`）。
 - **运行/调试**：`.vscode/launch.json` 中提供 `Operator`、`Gateway`、`Both` 三个配置，运行 `Both` 可同时启动控制面与接入层（对接本地 kind 的 kubeconfig）。
 - **settings**：工作区配置中的 `go.toolsEnvVars` 用于 `VSCode` 自身的 Go 工具环境变量；多 Go 版本共存时可通过 `go.gopath`、`go.goroot` 指定运行版本。
 
@@ -284,30 +291,28 @@ stateDiagram-v2
 
 ```
 .
-├── api/v1alpha1/                 # CRD 类型定义（kubebuilder）
-├── cmd/
-│   ├── operator/main.go
-│   ├── gateway/main.go
-│   └── node-agent/main.go
+├── api/v1alpha1/                 # CRD 类型 + labels（跨组件契约）+ zz_generated.deepcopy.go
+├── cmd/operator/main.go          # 装配层：scheme / 缓存收窄 / 隔离层 / 控制器
 ├── internal/
-│   ├── controller/               # sandbox / pool / template / resource_optimizer
-│   ├── claim/                    # CAS 认领协议
-│   ├── sweeper/                  # 泄漏对账
-│   ├── isolation/                # 隔离级别抽象层
-│   └── metrics/
+│   ├── controller/               # NextPhase 纯函数 + SandboxReconciler + tiers
+│   └── isolation/                # 隔离级别抽象层（配置校验 + 降级策略 + 探测）
 ├── config/
-│   ├── crd/bases/  rbac/  manager/  webhook/
-│   ├── base/                     # Kustomize base
-│   └── overlays/                 # local / kvm / staging / production
+│   ├── crd/                      # 生成的 CRD 清单 + kustomization
+│   ├── isolation/                # levels.yaml（隔离级别的唯一配置入口）+ ConfigMap
+│   ├── rbac/                     # 最小权限 RBAC，兼当可执行安全基线
+│   └── samples/                  # 命名空间 / 模板 / 池 / 沙箱示例
 ├── hack/
-│   ├── kind-config.yaml
-│   ├── smoke/                    # Kata / 网络策略冒烟测试
-│   ├── bootstrap/                # 节点初始化脚本
-│   └── loadtest/                 # 压测脚本
-└── test/
-    ├── e2e/                      # envtest + kind e2e
-    └── conformance/              # Kata 运行时一致性套件
+│   ├── kind-config.yaml          # E1 集群配置
+│   ├── smoke/                    # Kata / 网络策略冒烟用例
+│   ├── bootstrap/                # 节点初始化与 KVM/vsock 自检
+│   └── verify.ps1                # Windows 验证入口
+├── docs/                         # 设计文档 01–10
+├── Makefile                      # Linux / CI 验证入口
+└── go.mod  go.sum
 ```
+
+**规划中（M1）**：`cmd/gateway`、`cmd/node-agent`、`internal/claim`（CAS 认领协议）、
+`internal/sweeper`（泄漏对账）、`test/e2e`、`test/conformance`。
 
 ## 5. 主要功能
 
@@ -403,12 +408,12 @@ stateDiagram-v2
 <br>
 
 <div align="center">
-  <img src="https://img.shields.io/badge/kubernetes-1.30%2B-blue" alt="kubernetes" />
+  <img src="https://img.shields.io/badge/kubernetes-1.32%2B-blue" alt="kubernetes" />
   <img src="https://img.shields.io/badge/kata--containers-3.4-orange" alt="kata" />
   <img src="https://img.shields.io/badge/firecracker-1.7-purple" alt="firecracker" />
-  <img src="https://img.shields.io/badge/go-1.23%2B-00ADD8" alt="go" />
+  <img src="https://img.shields.io/badge/go-1.27%2B-00ADD8" alt="go" />
 </div>
 
 <div align="center">
-  <sub>Agent Sandbox Control Plane · 设计阶段 · 欢迎 Issue / PR</sub>
+  <sub>Agent Sandbox Control Plane · M0 骨架 · 欢迎 Issue / PR</sub>
 </div>

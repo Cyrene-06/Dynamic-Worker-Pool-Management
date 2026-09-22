@@ -1,14 +1,19 @@
-# hack/verify.ps1 —— Windows 上没有 make 时的等价验证入口。
+# hack/verify.ps1 -- Windows verification entry point (same checks as `make verify`).
 #
-# 为什么需要它：Makefile 依赖 POSIX shell，而 Windows 默认没有 make/bash。
-# 如果本地唯一能跑验证的方式是"先装 make + bash"，那"验证"这件事就会被跳过 ——
-# 实际上"跳过验证"远比"多写一个脚本"昂贵。
+# WHY THIS FILE IS ASCII-ONLY:
+#   Windows PowerShell 5.1 reads a .ps1 file WITHOUT a BOM as ANSI (the OEM code page),
+#   not UTF-8. Any non-ASCII literal here would be corrupted at **parse** time, and the
+#   failure mode is nasty: the script exits with -1 and prints nothing at all, which
+#   looks like "PowerShell is broken" rather than "the file encoding is wrong".
+#   Adding a BOM fixes it for today's file, but the next person editing it with a
+#   BOM-unaware editor silently reintroduces the bug. Pure ASCII removes the dependency
+#   on file encoding entirely. Project docs are in Chinese; this script intentionally is not.
 #
-# 用法：
+# Usage:
 #   powershell -ExecutionPolicy Bypass -File hack/verify.ps1
 #   powershell -ExecutionPolicy Bypass -File hack/verify.ps1 -Task test
 #
-# 工具链解析顺序：$env:LOCALAPPDATA\sandbox-tools → 已在 PATH 中的 go。
+# Toolchain resolution: $env:LOCALAPPDATA\sandbox-tools first, then whatever is on PATH.
 
 param(
     [ValidateSet('verify', 'fmt', 'fmt-check', 'vet', 'build', 'test', 'cover', 'manifests', 'generate')]
@@ -17,29 +22,34 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ---- 解析工具链 ----
+# ---- Resolve toolchain ----
 $toolRoot = Join-Path $env:LOCALAPPDATA 'sandbox-tools'
 if (Test-Path (Join-Path $toolRoot 'go\bin\go.exe')) {
     $env:Path = "$toolRoot\go\bin;$toolRoot\bin;$env:Path"
     $env:GOBIN = Join-Path $toolRoot 'bin'
 }
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-    Write-Host "找不到 go。请先安装 Go 1.23+，或把 go.exe 加入 PATH。" -ForegroundColor Red
+    Write-Host 'ERROR: go not found. Install Go 1.27+ or add go.exe to PATH.' -ForegroundColor Red
     exit 127
 }
 
+# gofmt takes directory arguments, not globs.
 $srcDirs = @('./api', './cmd', './internal')
 $failed = @()
 
 function Invoke-Step {
     param([string]$Name, [scriptblock]$Body)
-    Write-Host "`n=== $Name ===" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host "=== $Name ===" -ForegroundColor Cyan
+    # Reset before running: $LASTEXITCODE is process-wide and would otherwise leak
+    # the previous step's result into this one (a real footgun in this script).
+    $global:LASTEXITCODE = 0
     & $Body
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "$Name 失败（exit=$LASTEXITCODE）" -ForegroundColor Red
+        Write-Host "$Name FAILED (exit=$LASTEXITCODE)" -ForegroundColor Red
         $script:failed += $Name
     } else {
-        Write-Host "$Name 通过" -ForegroundColor Green
+        Write-Host "$Name OK" -ForegroundColor Green
     }
 }
 
@@ -48,7 +58,7 @@ function Invoke-Fmt { gofmt -w $srcDirs }
 function Invoke-FmtCheck {
     $out = gofmt -l $srcDirs
     if ($out) {
-        Write-Host "以下文件未通过 gofmt：" -ForegroundColor Red
+        Write-Host 'The following files are not gofmt-clean:' -ForegroundColor Red
         $out | ForEach-Object { Write-Host "  $_" }
         $global:LASTEXITCODE = 1
     } else {
@@ -57,8 +67,10 @@ function Invoke-FmtCheck {
 }
 
 function Invoke-Manifests {
-    # paths 用显式包路径而不是 ./api/...：PowerShell 会把 `...` 当作自己的记号，
-    # 传给 controller-gen 时会丢掉，结果报 "no Go files in ...\api"。
+    # Use an explicit package path rather than ./api/...
+    # PowerShell consumes the `...` token itself, so controller-gen receives a truncated
+    # path and reports "no Go files in ...\api" -- a confusing failure for a one-character
+    # difference. Explicit paths sidestep the whole class of problem.
     controller-gen crd paths=./api/v1alpha1 output:crd:artifacts:config=config/crd/bases
 }
 
@@ -85,7 +97,7 @@ switch ($Task) {
 
 Write-Host ''
 if ($failed.Count -gt 0) {
-    Write-Host "失败项: $($failed -join ', ')" -ForegroundColor Red
+    Write-Host "FAILED: $($failed -join ', ')" -ForegroundColor Red
     exit 1
 }
-Write-Host "全部通过。" -ForegroundColor Green
+Write-Host 'All checks passed.' -ForegroundColor Green

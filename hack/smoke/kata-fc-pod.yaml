@@ -1,0 +1,55 @@
+# Kata + Firecracker 冒烟测试 Pod —— 用于 E2/E3（带 /dev/kvm 的环境）。
+#
+# 这个文件的价值不在于"能起一个 Pod"，而在于**它定义的验证清单**：
+# 只有当 Pod 内看到的内核版本与宿主不同时，才证明 VM 级隔离真的生效了。
+# 这一点无法从 Pod 的 Running 状态推断 —— 如果 RuntimeClass 配置错了
+# （比如 handler 名字与 containerd 里的不一致，或节点上根本没装 kata），
+# Pod 会安静地回落到 runc 运行，一切看起来都正常，而隔离已经不存在。
+#
+# 平台侧的等价机制是 internal/isolation 的 Resolve + Degraded 标志：
+# 它把"降级"变成可观测的状态，而不是靠人肉检查 uname。
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kata-smoke
+  namespace: default
+  labels:
+    sandbox.example.com/role: sandbox
+    sandbox.example.com/isolation: kata-fc
+spec:
+  # 若集群里没有 kata-fc 这个 RuntimeClass，Pod 会卡在 ContainerCreating。
+  # 这是**期望行为**：宁可显式失败，也不要静默回落到 runc。
+  runtimeClassName: kata-fc
+
+  # RuntimeClass 自带 scheduling.nodeSelector，这里再写一遍是为了让
+  # "这个 Pod 该去哪"在一处就能读全（也方便单独测试没有 RuntimeClass 的环境）。
+  nodeSelector:
+    sandbox.example.com/isolation: kata-fc
+  tolerations:
+    - key: sandbox
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+
+  automountServiceAccountToken: false
+  restartPolicy: Never
+
+  containers:
+    - name: app
+      image: registry.k8s.io/busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        privileged: false
+        readOnlyRootFilesystem: true
+        runAsNonRoot: true
+        runAsUser: 10000
+        capabilities:
+          drop: ["ALL"]
+      resources:
+        requests:
+          cpu: "250m"
+          memory: "256Mi"
+        limits:
+          memory: "512Mi"

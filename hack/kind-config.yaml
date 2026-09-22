@@ -1,0 +1,44 @@
+# kind 集群配置 —— E1 环境（见 docs/09 §1 的环境矩阵）
+#
+# ⚠️ 一个必须先说清楚的事实：**kind 的"节点"是 Docker 容器，无法运行
+# Kata/Firecracker**。所以这里刻意不做 /dev/kvm 透传之类的尝试 ——
+# 那条路在 kind 上不可行（docs/02 D11、docs/06 §10.1）。
+# 硬凑出来的环境会给出"看起来能跑、结论不可信"的假象，比明确不支持更危险。
+#
+# 本环境的用途只有两个：
+#   1. 验证控制面逻辑：状态机全迁移、池化水位、回收、泄漏对账
+#   2. 验证 Kubernetes 原语行为：CRD 校验、CEL 规则、SSA 合并语义
+#
+# 隔离强度、启动延迟、节点密度必须去带 /dev/kvm 的环境验证（docs/06 §10.2）。
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sandbox-dev
+
+nodes:
+  - role: control-plane
+    # 控制面节点不承载沙箱，但打上标签便于统一处理。
+    labels:
+      sandbox.example.com/isolation: control-plane
+  - role: worker
+    labels:
+      # 节点标签与 isolation 抽象层的 nodeSelector 对齐：
+      # 这样即使有人绕过 SandboxPool 直接建 Pod，也不会落到错误的节点池。
+      sandbox.example.com/isolation: simulated
+  - role: worker
+    labels:
+      sandbox.example.com/isolation: simulated
+
+networking:
+  # 与 docs/06 §7.2 的 IPAM 规划对齐：每节点默认 /24（253 个 Pod IP），
+  # 足够支撑 maxSandboxesPerNode=60 的密度。
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  # 保留 kind 自带的 kindnet：
+  # E1 的目的是验证控制面逻辑，不需要网络策略能力。若关掉它就必须先装 Cilium，
+  # 否则集群处于"创建成功但 Pod 无法联网"的状态 —— 一个很容易浪费半小时的坑。
+  # 出口白名单（CiliumNetworkPolicy）的验证放在 E2/E3，见 docs/06 §7.2。
+  disableDefaultCNI: false
+
+# 说明：这里不配置 extraMounts / privileged。
+# 需要它们才能勉强跑 Kata 的场景属于 E2（KVM 单节点，docs/06 §10.2），
+# 不属于 kind。把这个边界写在这里，是为了防止后来者"顺手把 kind 改成 privileged"。
