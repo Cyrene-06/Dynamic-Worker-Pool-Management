@@ -7,13 +7,13 @@
 <div align="center">
   <img src="https://img.shields.io/badge/kubernetes-1.32%2B-blue" alt="kubernetes" />
   <img src="https://img.shields.io/badge/go-1.27%2B-00ADD8" alt="go" />
-  <img src="https://img.shields.io/badge/controller--runtime-v0.25.1-lightBlue" alt="controller-runtime" />
+  <img src="https://img.shields.io/badge/controller--runtime-v0.24.1-lightBlue" alt="controller-runtime" />
   <img src="https://img.shields.io/badge/kata--containers-3.4-orange" alt="kata-containers" />
   <img src="https://img.shields.io/badge/firecracker-1.7-purple" alt="firecracker" />
   <img src="https://img.shields.io/badge/cilium-1.16-green" alt="cilium" />
   <img src="https://img.shields.io/badge/karpenter-v1-yellow" alt="karpenter" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license" />
-  <img src="https://img.shields.io/badge/status-M0%20骨架-yellow" alt="status" />
+  <img src="https://img.shields.io/badge/status-M0%20完成%20%7C%20M1%20进行中-yellow" alt="status" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome" />
 </div>
 
@@ -123,9 +123,15 @@ Hi! 首先感谢你关注本项目。
 **环境要求**
 
 - Kubernetes >= **v1.30**
-- golang >= **v1.23**
+- golang >= **v1.27.1**（与 `go.mod` 的 `go` 指令一致；低版本会直接拒绝构建该模块）
 - containerd >= **1.7**（如需真实隔离，节点需具备 `/dev/kvm` 与 `vhost_vsock`）
 - IDE 推荐：**VS Code**（`Go` + `Kubernetes` 扩展）或 **Goland**
+
+> **依赖版本钉死说明**：`sigs.k8s.io/controller-runtime` 固定在 **v0.24.1**，不要升级到 v0.25.x。
+> v0.25.x 在 **Windows 上无法编译**：`pkg/internal/testing/process/signal_windows.go` 定义了 `signalProcess`，
+> 与同包内平台无关文件中的同名符号重复声明（`signalProcess redeclared in this block`），
+> 而 `signal_other.go` / `signal_unix.go` 用的是 `signalProcessImpl`。v0.25.1 是该分支最新版，上游尚无修复。
+> 该包仅在进程内 envtest 测试路径上被编译，因此**只影响本地/CI 的 Windows 开发者**。
 
 ### 2.1 控制面 Operator
 
@@ -137,8 +143,11 @@ cd Dynamic-Worker-Pool-Management
 # 生成 CRD / RBAC 清单与 DeepCopy（改了 api/ 下的类型后必跑）
 make manifests generate
 
-# 单元测试：纯函数 + 隔离抽象层，不需要集群、不需要 KVM
+# 单元测试：纯函数状态机 + 隔离抽象层 + 弹性算法，不需要集群、不需要 KVM
 make test
+
+# 需要真实 API Server 的测试：CAS 认领并发冲突、CRD 校验（依赖 envtest，不需要 Docker）
+make test-envtest
 
 # 完整验证（格式 + vet + 构建 + 测试）—— 提交前跑这一条就够
 make verify
@@ -151,6 +160,11 @@ make deploy-local
 > Windows 上没有 make 时，用等价入口：
 > `powershell -ExecutionPolicy Bypass -File hack/verify.ps1`
 > （支持 `-Task verify|fmt|vet|build|test|manifests|generate`）
+
+> **envtest 说明**：`make test-envtest` 会调用 `setup-envtest` 下载并缓存 etcd / kube-apiserver 二进制，
+> **完全不需要 Docker**（与 kind 不同）。未设置 `KUBEBUILDER_ASSETS` 时，`internal/claim` 的集成测试会
+> 主动 **skip** 而不是失败——目的是让"没装 envtest"的开发者也能跑 `make test` 拿到真实绿灯，
+> 而不是把环境缺失伪装成跳过。CI 中请务必设置该变量。
 
 ### 2.2 本地开发集群（kind）
 
@@ -180,7 +194,9 @@ kubectl get agentsandbox -n sandbox-pool -o yaml
 kubectl describe sandboxpool fc-small
 ```
 
-> OpenAPI 参考文档与 `kubebuilder` 生成的字段说明将随 M0 里程碑提供；当前字段设计请见 [docs/04-api-and-state-machine.md](docs/04-api-and-state-machine.md)。
+> 3 个 CRD 的 OpenAPI schema 由 `make manifests` 从 Go 类型生成到 `config/crd/bases/`，**已随仓库提交**；
+> 字段级设计说明与状态机语义见 [docs/04-api-and-state-machine.md](docs/04-api-and-state-machine.md)。
+> 需要可读的 API 文档时直接看 `kubectl explain agentsandbox.spec`（schema 已带完整描述与校验）。
 
 ### 2.4 真实隔离环境（KVM 单节点）
 
@@ -203,13 +219,18 @@ kubectl exec -it kata-smoke -- uname -r
 
 ### 2.5 VSCode 工作区
 
-- **开发**：使用 `VSCode` 打开仓库根目录，`Go` 扩展会自动加载 `go.mod`；`config/` 下是 Kustomize 清单（`crd` / `isolation` / `rbac` / `samples`）。
-- **运行/调试**：`.vscode/launch.json` 中提供 `Operator`、`Gateway`、`Both` 三个配置，运行 `Both` 可同时启动控制面与接入层（对接本地 kind 的 kubeconfig）。
-- **settings**：工作区配置中的 `go.toolsEnvVars` 用于 `VSCode` 自身的 Go 工具环境变量；多 Go 版本共存时可通过 `go.gopath`、`go.goroot` 指定运行版本。
+- **开发**：使用 VS Code 打开仓库根目录，`Go` 扩展会自动加载 `go.mod`；`config/` 下是 Kustomize 清单（`crd` / `isolation` / `rbac` / `samples`）。
+- **运行/调试**：`.vscode/launch.json` 提供 `Operator` 调试配置（`simulated` 隔离，对接本地 kubeconfig）；`Gateway` / `Both` 配置随 M1 的接入层一起补齐。
+- **settings**：`.vscode/settings.json` 中的 `go.toolsEnvVars` 用于 VS Code 自身 Go 工具的环境变量。
+  **本项目不提交任何绝对路径**（如 `KUBEBUILDER_ASSETS`）—— 它随机器而异，写进仓库必然在别人机器上失效；
+  请改为在自己的 shell 或用户级配置中设置。
 
 ## 3. 技术选型
 
-- **控制面**：使用 [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) 构建 Operator，[kubebuilder](https://book.kubebuilder.io/) 仅作为脚手架与代码生成器；不引入 operator-sdk 的重框架。
+- **控制面**：使用 [controller-runtime](https://github.com/kubernetes-sigs/controller-runtime) 构建 Operator，代码生成只用 `controller-gen`（`controller-tools`）；不引入 operator-sdk 的重框架。
+  ⚠️ **不使用 kubebuilder 脚手架**：v4 没有 Windows 发行版，且 `sigs.k8s.io/kubebuilder/v4` 模块不含 `cmd` 包，
+  `go install` 必然失败。骨架按 [docs/09](docs/09-deployment-environments.md) 的 Kustomize 布局手写，
+  这样 macOS / Linux / Windows 三端行为一致，且避免脚手架生成一堆没人维护的文件。
 - **抽象层**：自定义 CRD（`AgentSandbox` / `SandboxPool` / `SandboxTemplate`），承载状态机、TTL、认领、休眠等原生对象无法表达的语义。
 - **隔离运行时**：主用 [Kata Containers](https://katacontainers.io/) + [Firecracker](https://firecracker-microvm.github.io/)，通过 `RuntimeClass` 暴露；[Cloud Hypervisor](https://www.cloudhypervisor.org/) 作为需更多设备能力时的折中；runc 用于可信负载与本地开发。
 - **调度**：默认 `kube-scheduler` 的第二个 profile（`NodeResourcesFit` = `MostAllocated`）实现装箱，不引入第三方调度器。

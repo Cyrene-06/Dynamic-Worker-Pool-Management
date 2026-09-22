@@ -61,6 +61,7 @@ const (
 	ReasonStockReady            ConditionReason = "StockReady"
 	ReasonColdPathClaimed       ConditionReason = "ColdPathClaimed"
 	ReasonClaimed               ConditionReason = "Claimed"
+	ReasonClientReleased        ConditionReason = "ClientReleased"
 	ReasonStockRotation         ConditionReason = "StockRotation"
 	ReasonReuseLimitReached     ConditionReason = "ReuseLimitReached"
 	ReasonHardDeadline          ConditionReason = "HardDeadline"
@@ -267,6 +268,23 @@ func decideStock(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Observation)
 // 回收判据的顺序**本身就是设计**：按"业务破坏性从小到大、证据强度从高到低"排列。
 // 先问最确凿、最不可争辩的问题（硬期限、节点失联），再问需要推断的问题（空闲）。
 func decideClaimed(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Observation) Decision {
+	// 0. 业务已释放：spec.claim 被清空。
+	//
+	// 这是**最常见的正常回收路径**，必须显式处理。原实现只在 decideStock
+	// 里检查该字段，于是已认领的沙箱被释放后会一直停在 Running，
+	// 直到 TTL 兜底 —— 而 TTL 可能是 2 小时。
+	// 症状是“资源迟迟不释放”且没有任何报错，极难定位。
+	//
+	// 关于 ReturnToPool：本设计里它**当前与 Destroy 行为一致**（都回收）。
+	// 同租户原地复用必须先执行 SandboxTemplate 的 resetHook 清理工作区、
+	// 杀残留进程、轮换凭据 —— 在那套机制（M2）落地之前，宁可少省一次冷启动，
+	// 也不能把一个可能残留上一位用户数据的沙箱交出去。
+	// 这是安全边界，不是一个可以“先跑起来再说”的优化项。
+	if sbx.Spec.Claim == nil {
+		return ReclaimDecision(sandboxv1alpha1.PhaseTerminating, ReasonClientReleased,
+			sandboxv1alpha1.RecycleClientReleased)
+	}
+
 	// 1. 硬期限：业务自己给的 SLA 兜底，优先级高于平台推导的一切。
 	if hardDeadlinePassed(sbx, o.Now) {
 		return ReclaimDecision(sandboxv1alpha1.PhaseTerminating, ReasonHardDeadline,

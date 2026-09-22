@@ -1,0 +1,23 @@
+{
+  // 只放"与机器无关"的配置。
+  //
+  // 刻意不写 KUBEBUILDER_ASSETS 这类绝对路径：它随机器/用户而异，
+  // 提交进仓库必然在别人机器上失效，而且会以"测试莫名失败"的形式暴露，
+  // 很难定位到是配置而不是代码的问题。需要时请在自己的 shell
+  // 或用户级配置里设置（见 README §2.1）。
+  "go.toolsEnvVars": {
+    "GOFLAGS": "-mod=mod"
+  },
+  "go.testFlags": ["-count=1"],
+  "go.lintOnSave": "package",
+  "go.formatTool": "gofmt",
+  "files.eol": "\n",
+  "[go]": {
+    "editor.formatOnSave": true,
+    "editor.insertSpaces": false
+  },
+  "[yaml]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2
+  }
+}

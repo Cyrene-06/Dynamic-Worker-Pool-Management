@@ -63,7 +63,7 @@ build: ## 编译全部包
 	go build ./...
 
 .PHONY: test
-test: ## 单元测试（纯函数，不需要集群与 KVM）
+test: ## 单元测试（纯函数；若已设 KUBEBUILDER_ASSETS 则一并跑 envtest 集成测试，否则自动 skip）
 	go test ./... -count=1
 
 .PHONY: cover
@@ -81,9 +81,12 @@ envtest-assets: $(SETUP_ENVTEST) ## 下载 envtest 的 etcd / kube-apiserver
 	$(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/k8s -p path
 
 .PHONY: test-envtest
-test-envtest: envtest-assets ## 跑需要真实 API Server 的测试（CRD 校验、状态机集成）
+test-envtest: envtest-assets ## 跑需要真实 API Server 的测试（CAS 认领并发、CRD 校验）
 	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN)/k8s -p path)" \
-		go test ./internal/... -count=1 -tags envtest
+		go test ./... -count=1
+# 刻意不加 -tags：本项目的 envtest 测试靠 KUBEBUILDER_ASSETS 控制是否 skip，
+# 而不是 build tag。加 tag 会产生两组分叉的测试集合，且 `make test` 在资产已就绪时
+# 仍然会静默跳过它们 —— 那是“以为覆盖了、其实没跑”的经典成因。
 
 ##@ 本地集群
 

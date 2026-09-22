@@ -136,6 +136,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 池控制器。刻意不暴露并发度参数：池决策是全局的，
+	// 并发执行会让多个 goroutine 各自看到同一个缺口并各自扩容，
+	// 直接造成数倍超额扩容（docs/09 §4）。SetupWithManager 内部固定为 1。
+	if err := (&controller.PoolReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Resolver: resolver,
+		Recorder: mgr.GetEventRecorderFor("pool-controller"),
+		// 骨架阶段命中率指标按"未知"处理，反馈项保持中性。
+		// M3 接入 Prometheus 后替换为真实实现。
+		HitRatio: controller.StaticHitRatio{},
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "注册 PoolController 失败")
+		os.Exit(1)
+	}
+
 	// ---- 健康检查 ----
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		logger.Error(err, "注册 healthz 失败")

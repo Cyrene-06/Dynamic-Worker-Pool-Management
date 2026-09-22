@@ -21,6 +21,19 @@ func newSbx(phase sandboxv1alpha1.Phase, age time.Duration) *sandboxv1alpha1.Age
 	s.Namespace = "sandbox-pool"
 	s.CreationTimestamp = metav1.NewTime(t0.Add(-age))
 	s.Status.Phase = phase
+
+	// 满足不变式 INV-2：已认领阶段必须持有 claim。
+	//
+	// 不设它会怎样：decideClaimed 的第一条规则是"claim 为空 = 业务已释放"，
+	// 于是每个"已认领"用例都会被误判成释放而失败。
+	// 这不是为了让测试通过而补的表面功夫：真实对象**一定**满足该不变式
+	// （库存阶段没有 claim，认领方写入 claim，控制器才会把阶段推到 Running），
+	// 夹具不满足它才是真正的失真。
+	if phase.IsClaimedPhase() {
+		s.Spec.Claim = &sandboxv1alpha1.ClaimSpec{
+			RequestedBy: sandboxv1alpha1.ClaimRequestedBy{Tenant: "t-1", RequestID: "req-test"},
+		}
+	}
 	return s
 }
 
@@ -146,6 +159,20 @@ func TestNextPhase(t *testing.T) {
 			},
 			want:    sandboxv1alpha1.PhaseFailed,
 			reason:  ReasonNodeLost,
+			reclaim: true,
+		},
+		{
+			// 最常见的正常回收路径：业务主动释放（清空 spec.claim）。
+			// 原实现只在库存分支检查该字段，于是已认领的沙箱被释放后会
+			// 一直停在 Running，直到 TTL 兜底 —— 而 TTL 可能是 2 小时。
+			// 症状是"资源迟迟不释放"且没有任何报错，极难定位。
+			name: "Running 且业务已释放（claim 被清空）→ 回收",
+			sbx:  newSbx(sandboxv1alpha1.PhaseRunning, 60*time.Second),
+			mutate: func(s *sandboxv1alpha1.AgentSandbox, _ *Observation) {
+				s.Spec.Claim = nil
+			},
+			want:    sandboxv1alpha1.PhaseTerminating,
+			reason:  ReasonClientReleased,
 			reclaim: true,
 		},
 		{

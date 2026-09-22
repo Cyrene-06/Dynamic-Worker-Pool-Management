@@ -31,6 +31,14 @@ const (
 	LabelRequestID = "sandbox.example.com/request-id"
 )
 
+// 平台命名空间。库存与已认领沙箱都在 sandbox-pool 里，租户不直接操作
+// Kubernetes API（只走 gateway）—— 因为 Kubernetes RBAC 无法表达
+// "只能看到属于自己租户的对象"（docs/04 §0 P1）。
+const (
+	NamespacePool   = "sandbox-pool"
+	NamespaceSystem = "sandbox-system"
+)
+
 // 角色取值。
 const (
 	RoleSandbox     = "sandbox"
