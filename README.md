@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/cilium-1.16-green" alt="cilium" />
   <img src="https://img.shields.io/badge/karpenter-v1-yellow" alt="karpenter" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license" />
-  <img src="https://img.shields.io/badge/status-M0%20完成%20%7C%20M1%20进行中-yellow" alt="status" />
+  <img src="https://img.shields.io/badge/status-M1%20已关闭%20%7C%20M2%20待启动-yellow" alt="status" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome" />
 </div>
 
@@ -78,12 +78,12 @@ flowchart LR
 
 ## 重要提示
 
-1. **当前处于 M0 骨架阶段**：已落地 CRD 定义、隔离抽象层、状态机与控制器骨架（`internal/controller` 的 `NextPhase` 是纯函数，21 个单测全绿）。**尚未实现**：`PoolController`、`sandbox-gateway`、Pod 之外的资源清理（M1）。隔离验证仍需带 `/dev/kvm` 的环境。
+1. **M1（池化与生命周期）已于 2026-09-22 关闭，M2 待启动**：控制面交付物齐备 —— `PoolController`（水位闭环 / 阻尼 / 限速）、CAS 认领协议、TTL/空闲/心跳回收、5 步 Finalizer 链 + Sweeper 对账、`sandbox-gateway`（REST / 鉴权 / 配额 / 幂等 / 错误语义）、雪崩保护（`protectMode`）、三镜像共用一个 `Dockerfile`、`config/manager/` 部署清单。**但 8 项退出标准里 5 项未执行、3 项只完成一半**，原因全部是同一个：本机缺一个能跑 Linux 容器的宿主，不是代码或设计问题。逐条状态与解除条件见 [docs/10 §1 M1 关闭记录](docs/10-roadmap-risks.md)；**未验证项的唯一状态源是本文 §2.6**（⚠️/❌ 不是装饰）。隔离验证仍需带 `/dev/kvm` 的环境。
 2. 阅读或实践本项目需要一定的 **Kubernetes Operator 开发（Go）** 与 **容器运行时** 基础。
 3. 主隔离方案 Kata Containers + Firecracker 要求节点具备 `/dev/kvm`（裸金属或支持嵌套虚拟化的实例）；**本地 kind 环境无法真实验证隔离**，只能用 `simulated` 模式验证控制逻辑。
 4. 文档中所有性能数字均为**量级参考**，必须以本项目的压测基线校正后才能写入 SLO。
 5. 本项目**不含** Agent 业务逻辑（推理编排、工具调用实现）与 GPU 直通场景，边界见 [docs/01-requirements.md](docs/01-requirements.md)。
-6. 仓库尚未包含 `LICENSE` 文件，将于首个代码里程碑补齐（计划 Apache License 2.0）。在此之前请勿将本仓库内容用于商业分发。
+6. 仓库尚未包含 `LICENSE` 文件，计划 Apache License 2.0。原计划“随首个代码里程碑补齐”，**M1 关闭时仍未添加**（已记入 [docs/10](docs/10-roadmap-risks.md) 的遗留项）；在补齐之前请勿将本仓库内容用于商业分发。
 
 <br>
 
@@ -253,6 +253,10 @@ make sweeper-local
 ### 2.6 尚未被验证的边界
 
 这一节是刻意保留的。把它删掉，下面的东西就会被读成"已经好了"。
+
+> M1 关闭时（2026-09-22）这张表**就是**未验证项的正式清单：里程碑的“已关闭”是排期决策，
+> 不是“这些都过了”。表里的 ⚠️/❌ 在 [docs/10](docs/10-roadmap-risks.md) 的「M1 关闭记录」里
+> 逐条对应，并写明了解除条件。
 
 | 能力 | 状态 | 缺少什么才能验证 |
 |---|---|---|
@@ -484,9 +488,10 @@ stateDiagram-v2
 └── go.mod  go.sum
 ```
 
-**规划中（M1 收尾）**：`cmd/node-agent`、`template_controller`、`resource_optimizer`、
-`test/e2e`（kind 端到端）、`test/conformance`（Kata 一致性套件）、
-以及修掉 `config/manager` 那条 RBAC 缺口（PVC 权限）。
+**规划中（M2 及以后）**：`cmd/node-agent`、`template_controller`、`resource_optimizer`、
+`test/e2e`（集群内端到端；Windows 入口是 `hack/kind-e2e.ps1`）、
+`test/conformance`（Kata 一致性套件）、控制器与对账侧的指标导出（现为显式占位，M3 接入）、
+以及可直接导入的 Grafana 看板 JSON（面板设计见 [docs/08 §6](docs/08-observability-security.md)）。
 
 ## 5. 主要功能
 
@@ -564,5 +569,5 @@ stateDiagram-v2
 </div>
 
 <div align="center">
-  <sub>Agent Sandbox Control Plane · M0 骨架 · 欢迎 Issue / PR</sub>
+  <sub>Agent Sandbox Control Plane · M1 已关闭 · 欢迎 Issue / PR</sub>
 </div>
