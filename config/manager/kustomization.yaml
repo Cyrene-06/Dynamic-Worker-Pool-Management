@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 控制面 Operator 清单。依赖 config/rbac 里的 ServiceAccount `sandbox-operator`
+# 与 ClusterRole，因此部署顺序是：先 `kubectl apply -k config/rbac`，
+# 再 apply 本目录（make deploy-operator 把这两步串在一起）。
+#
+# 与 config/isolation 的关系是**隐式**的：控制器从 ConfigMap
+# `sandbox-system/sandbox-isolation` 读取隔离级别。不在这里 resources 里
+# 包含 ../isolation，是为了让"隔离级别配置变更"保持为一次独立、可审计的操作 ——
+# 它改变的是集群里"哪些运行时可用"这个事实，不该和一次 Deployment 滚动混在一起。
+resources:
+  - deployment.yaml

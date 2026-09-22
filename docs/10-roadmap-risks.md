@@ -53,6 +53,8 @@ gantt
 | Finalizer 链 + 泄漏对账 | 5 个 Finalizer + Sweeper CronJob |
 | `sandbox-gateway` | REST API、鉴权、配额、幂等键、错误语义 |
 | 保护模式 | 雪崩保护（[05 §5](05-warm-pool-and-scaling.md)） |
+| 容器镜像 | 三个组件共用一个多阶段 `Dockerfile`（distroless 运行时、多架构）；**尚未在可用运行时上构建过** |
+| 控制面部署清单 | `config/manager/`（Deployment + 指标 Service + PDB，含 leader election 与探针）；**仅渲染验证，且待补 PVC 权限** |
 
 **退出标准**：
 - [ ] 在 kind 上模拟 200 创建/秒，**命中率 > 90%**，无泄漏（对账指标 0）
@@ -61,6 +63,10 @@ gantt
 - [ ] 12 小时长跑：无内存增长、无孤儿资源、无卡住的 Finalizer
 - [ ] 全部 SLO 指标有对应 PromQL 与看板面板
 - [ ] 故障注入（杀 Operator / 杀 Pod / 断 Lease）后状态机自愈正确
+- [ ] 三个镜像可构建可推送，且 Trivy 扫描无 HIGH/CRITICAL（**当前未达成：未在真实运行时上构建过**）
+- [ ] `sandbox-operator` **以容器方式**在 kind 上跑通（含 leader election 切换）—— 判据必须是
+      “Pod 里的 ServiceAccount”而不是“开发者 kubeconfig”：后者是 cluster-admin，会把
+      RBAC 缺口全部掩盖掉（见 R17）
 
 **风险**：池振荡（最高概率的翻车点）。**缓解**：先以静态水位（`minWarm` 恒定）上线，通过后再逐项打开预测与阻尼参数。
 
@@ -173,6 +179,7 @@ gantt
 | **R14** | 依赖 alpha/beta K8s 特性（in-place resize 等）导致版本受阻 | 中 | 中 | 不把 alpha 特性作为核心路径；特性探测 + 优雅降级（[07 §7](07-resource-optimization.md)） | 目标 K8s 版本不支持 | 架构组 |
 | **R15** | 团队对 Kata 运维不熟悉，故障定位慢 | **高** | 中 | M2 培训；runbook（[06 §11](06-isolation-runtime.md)）；故障演练；上游社区跟进 | MTTR > 1h | 运行时团队 |
 | **R16** | 多 AZ 部署下池容量分散，单 AZ 故障无法承接 | 中 | 高 | 按 AZ 独立维持水位；每 AZ 保留冗余容量；跨 AZ 申请重试策略 | AZ 故障演练失败 | 平台团队 |
+| **R17** | **本地能跑、集群内跑不起来**：开发机用自己的 kubeconfig（通常是 cluster-admin），掩盖了 ServiceAccount 权限缺口与被缓存对象的读取权限缺口 | **高** | 高 | 每个组件都必须以**自己的 ServiceAccount** 在集群内跑通一轮；把代码里实际访问的资源与被授予的 RBAC 做一次对照；错误日志里出现 `forbidden` 一律当缺陷而非噪声 | 首次 in-cluster 部署失败（403 / 缓存无法同步 / 清理步骤被跳过） | 平台团队 |
 
 ### 3.1 风险热力图
 

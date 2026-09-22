@@ -1,0 +1,40 @@
+# 构建上下文的过滤规则。
+#
+# 一个反直觉但很实际的事实：**上下文里有什么会改变缓存键**。
+# 不排除 .git 的话，每次 commit 都会让 Dockerfile 里的 `COPY . .` 这一层失效，
+# 而紧随其后的就是编译 —— 于是只改了一个 Markdown 文档也会触发全量重编。
+# 这是"构建有时很快有时很慢"最常见的成因，也直接影响 CI 时长。
+#
+# 另一条原则：排除的东西必须是**构建确实不需要**的。
+# 下面刻意保留了 config/、hack/、test/ —— 它们很小，而保留它们意味着
+# 在容器里调试时 `go build ./...` / `go vet ./...` 仍然是完整的，
+# 不会因为少了一个包而得到"上下文被裁剪过"的误导性结果。
+
+# ---- 版本控制与编辑器 ----
+.git
+.github
+.gitignore
+.gitattributes
+.vscode
+.idea
+*.code-workspace
+*.swp
+
+# ---- 构建产物与本地状态 ----
+bin
+dist
+build
+vendor
+cover.out
+coverage.out
+*.test
+*.log
+tmp
+
+# ---- 与镜像无关的仓库内容 ----
+# 设计文档、README 等不参与编译，但会让上下文大出好几倍，
+# 而每次构建都要把它们打包推给 docker daemon。
+docs
+*.md
+README.md
+Makefile

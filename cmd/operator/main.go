@@ -91,6 +91,20 @@ func main() {
 				&coordinationv1.Lease{}: {
 					Namespaces: map[string]cache.Config{namespace: {}},
 				},
+				// PVC 只在 Finalizer 链的 volume 步骤被 List（finalizers.go 的
+				// finalizeVolumeCleanup），而且只会在沙箱命名空间里出现。
+				// 按命名空间收窄有两个作用：
+				//   1. 缓存成本不随集群里其它工作负载的卷数量增长；
+				//   2. 权限可以是 namespaced Role，而不是一条集群级的
+				//      persistentvolumeclaims 读权限（见 config/rbac）。
+				//
+				// 代价要说清楚：收窄之后，一旦有人让控制器去动别的命名空间的 PVC，
+				// 得到的是显式错误（controller-runtime 的
+				// "unknown namespace for the cache"）而不是空列表。
+				// 报错而不是静默地什么都没做，正是这里想要的方向。
+				&corev1.PersistentVolumeClaim{}: {
+					Namespaces: map[string]cache.Config{namespace: {}},
+				},
 			},
 		},
 	})

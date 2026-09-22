@@ -1,0 +1,53 @@
+# Operator 在**沙箱命名空间**内需要的权限。
+#
+# 为什么要单独一份、而且用 Role 而不是 ClusterRole：
+#   `rbac.yaml` 里的 ClusterRole 回答的是"控制面能看到集群里的什么"，适合集中评审。
+#   这一份回答的是另一个问题："Operator 在它负责的那个命名空间里能做什么"。
+#   两件事混进同一个 ClusterRole，就会把"清理沙箱数据卷"变成一份**集群级**的
+#   PVC 读删权限 —— 那是完全不同的风险量级，不该因为图省事而合并。
+#
+# 为什么需要它（这是一处被漏掉过的权限）：
+#   Finalizer 链的 volume 步骤（internal/controller/finalizers.go 的
+#   finalizeVolumeCleanup）会按 label 列出数据卷并逐个删除。
+#   这个 List 走的是 manager 缓存，而缓存按命名空间收窄
+#   （cmd/operator/main.go 的 ByObject 里给 PersistentVolumeClaim 设了
+#   Namespaces）。所以这里给的是一条 namespaced 规则，而不是 ClusterRole 里的一行。
+#
+# 漏掉它的症状很有欺骗性（见 docs/10 R17）：
+#   本地 `go run` 用的是开发者的 kubeconfig（通常是 cluster-admin），
+#   一切正常；一进集群就表现为缓存无法同步、卷清理步骤被跳过 ——
+#   而这两件事都不会在单元测试里出现，因为测试用的是 envtest 的 admin 身份。
+#
+# ⚠️ 作用域耦合（改一处必须改另一处）：
+#   本文件里两个对象的 `namespace` 必须与 Operator 的 `--namespace` 取值一致
+#   （config/manager/deployment.yaml 里是 sandbox-pool），也必须与
+#   cmd/operator/main.go 收窄缓存时用的那个命名空间一致。
+#   漏改的症状是 403（"persistentvolumeclaims is forbidden"）而不是退化成空列表 ——
+#   这是刻意的方向：权限不对时应该响亮地失败，而不是安静地少清理一批资源。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-operator-sandbox-namespace
+  namespace: sandbox-pool
+rules:
+  # 回收沙箱数据卷。
+  # 刻意**没有** create / update：卷由业务侧（或后续里程碑的卷供给器）创建，
+  # 控制面只负责"删干净"。给 create 会让控制面有能力凭空造出计费资源 ——
+  # 那是不必要的爆炸半径。
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sandbox-operator-sandbox-namespace
+  namespace: sandbox-pool
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: sandbox-operator-sandbox-namespace
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-operator
+    namespace: sandbox-system

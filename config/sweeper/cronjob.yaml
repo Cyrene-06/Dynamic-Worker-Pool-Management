@@ -58,7 +58,9 @@ spec:
               type: RuntimeDefault
           containers:
             - name: sweeper
-              # 上线时必须替换为真实镜像。
+              # 与 Makefile 的 SWEEPER_IMAGE 同名同 tag（make docker-build）。
+              # 上线时必须换成不可变 tag 或 digest：对账的行为完全取决于它的版本，
+              # 而"这份报告是哪个版本的对账给出的"必须能被回答。
               image: ghcr.io/cyrene-06/dwp-sweeper:dev
               args:
                 # 阈值与 internal/sweeper.DefaultOptions 保持一致。

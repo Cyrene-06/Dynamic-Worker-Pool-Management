@@ -253,7 +253,8 @@ make sweeper-local
 | 接入层全部路由与错误语义 | ✅ httptest + envtest（真实 API Server） | — |
 | 泄漏对账的判断逻辑 | ✅ 纯函数穷举测试 | — |
 | 运营商清单（gateway / sweeper） | ⚠️ 仅用 `kubectl kustomize` 渲染验证过 | 一个真集群 + 镜像 |
-| 容器镜像 | ❌ 仓库里还没有 Dockerfile | 可用的容器运行时（本机 Docker Desktop 未初始化、WSL2 未启用） |
+| 容器镜像（`Dockerfile`） | ⚠️ 已写好（多阶段 + distroless + 多架构），但**未真正构建过** | 可用的容器运行时（本机 Docker Desktop 已装，但 Linux 引擎未初始化） |
+| Operator 的 Deployment 清单（`config/manager`） | ⚠️ 仅渲染验证过；PVC 权限与缓存作用域已对齐 | 在真集群验证 leader election / 探针 / 卷回收 |
 | kind 端到端（申请→认领→回收全链） | ❌ 未跑通 | 同上 |
 | Kata / Firecracker 真实隔离、启动延迟、cgroup 冻结 | ❌ 本机物理上做不到 | 带 `/dev/kvm` 的 Linux 节点（本机无 KVM） |
 | 接入令牌的**强制** | ❌ 数据面代理尚未实现 | 一个校验令牌的连接代理；在那之前它只是一份凭据，不是一道防线 |
@@ -270,6 +271,75 @@ make sweeper-local
 - **settings**：`.vscode/settings.json` 中的 `go.toolsEnvVars` 用于 VS Code 自身 Go 工具的环境变量。
   **本项目不提交任何绝对路径**（如 `KUBEBUILDER_ASSETS`）—— 它随机器而异，写进仓库必然在别人机器上失效；
   请改为在自己的 shell 或用户级配置中设置。
+
+### 2.8 构建容器镜像
+
+三个组件（`operator` / `gateway` / `sweeper`）共用仓库根目录的**同一个** `Dockerfile`，
+用 `--build-arg BINARY=` 选择编译哪个 `cmd/` 包。这不是为了省文件：三个镜像的差别只有这一点，
+拆成三份后“升级 Go 版本”就变成改三处，漏一处就出现“某个组件还是旧 Go 编的”——
+而那类差异只在安全扫描报告里看得见。
+
+| 阶段 | 基础镜像 | 为什么是它 |
+|---|---|---|
+| 构建 | `golang:1.27.1-alpine`（固定跑在构建机架构上） | 用 `$TARGETOS/$TARGETARCH` 交叉编译，多架构构建不需要 QEMU 模拟 |
+| 运行 | `gcr.io/distroless/static-debian12:nonroot` | 带 CA 证书包（控制面访问 API Server 必需；`scratch` 会因此报 x509 错误）；无 shell、无包管理器；UID 65532 与清单里的 `securityContext.runAsUser` 一致 |
+
+```bash
+# 构建三个镜像（本地架构）。tag 由 IMAGE_TAG 控制，默认 dev
+make docker-build
+
+# 只改一个组件时也可以直接调 docker —— BINARY 必须显式给，Dockerfile 刻意没有默认值
+docker build --build-arg BINARY=sweeper -t ghcr.io/cyrene-06/dwp-sweeper:dev .
+
+# 多架构构建并推送（需要先 docker login ghcr.io）
+make docker-buildx
+
+# 静态检查 Dockerfile —— **不需要容器运行时**，所以本机 Docker 坏掉时依然可用
+# （需要 hadolint 在 PATH 上）
+make dockerfile-lint
+
+# 把镜像放进 kind 集群
+make kind-up        # 若集群尚未创建
+make kind-load      # 等价于 kind load docker-image ...（不经过任何 registry）
+
+# 一条命令把控制面部署起来并等就绪：
+#   crd → samples（建命名空间）→ rbac → isolation → manager → rollout status
+make kind-e2e
+
+# 接入层与对账（可选；gateway 需要先手工创建 Secret sandbox-gateway-auth）
+kubectl apply -k config/gateway
+kubectl apply -k config/sweeper
+```
+
+> **`make kind-load` 是必需步骤，不是可选优化**：kind 的“节点”是 Docker 容器，
+> 它们**看不到你本机 docker 的镜像缓存**。跳过这一步会一直 `ImagePullBackOff`，
+> 而报错看起来像是“仓库里没有这个镜像”，很容易把人引向错误的排查方向。
+>
+> **tag 不要用 `:latest`**：kubelet 对 `:latest` 默认 `imagePullPolicy: Always`，
+> 会绕过 load 进去的镜像去远端拉。本仓库统一用 `:dev`；发布时用
+> `IMAGE_TAG=v0.1.0 make docker-build docker-push`，并把 `config/` 下两份清单里的
+> 镜像改成同一个 tag **或 digest**（细节见 `config/gateway/deployment.yaml` 头注释）。
+>
+> 构建阶段要用 `go mod download` 拉依赖，因此**代理不可达的网络里必须显式指定**：
+> `make docker-build GOPROXY=https://goproxy.cn,direct`。
+> 不指定时的现象是“不报错但一直不动”，比失败更难发现。
+>
+> 同一类问题还有一处：`# syntax=docker/dockerfile:1` 会让 BuildKit 去拉那个前端镜像，
+> 拉不到时构建会在开头就失败，而报错里只有镜像名 —— 看起来像 Dockerfile 写错了。
+> 要么配镜像加速，要么删掉该行与 `--mount=type=cache` 参数回退经典构建器。
+>
+> ⚠️ 三件事当前还做不到，不要把它们读成已完成：
+> 一是本机容器运行时不可用（`docker info` **会挂住而非快速失败**），所以上面的构建命令
+> **尚未在真实环境里跑过一次**；
+> 二是 `config/manager/`（Operator 的 Deployment）已写好，同样**只在渲染层面验证过**；
+> 三是“以 Pod 里的 ServiceAccount 跑通”这件事还没做过 —— 而很多缺口只会在那种情况下暴露：
+> 例如曾经漏掉的 PVC 权限（现已补齐：`config/rbac/operator-sandbox-namespace.yaml`
+> 的 namespaced Role + `cmd/operator/main.go` 收窄的缓存），
+> 本地用开发者 kubeconfig（通常是 cluster-admin）跑**永远看不见**（docs/10 R17）。
+>
+> 容器运行时本身出问题时，先跑 `powershell -ExecutionPolicy Bypass -File hack/docker-doctor.ps1`：
+> 它逐层报告 CLI / 守护进程 / Docker Desktop 服务 / WSL / 虚拟化的状态，并打印需要
+> **管理员权限**的修复步骤（脚本自身只读、不提权）。
 
 ## 3. 技术选型
 
@@ -358,28 +428,41 @@ stateDiagram-v2
 
 ```
 .
+├── Dockerfile                    # operator / gateway / sweeper 共用的多阶段构建
+├── .dockerignore                 # 构建上下文过滤（.git 必须排除，否则每次 commit 都让 COPY 层失效）
 ├── api/v1alpha1/                 # CRD 类型 + labels（跨组件契约）+ zz_generated.deepcopy.go
-├── cmd/operator/main.go          # 装配层：scheme / 缓存收窄 / 隔离层 / 控制器
+├── cmd/
+│   ├── operator/main.go          # 控制面装配层：scheme / 缓存收窄 / 隔离层 / 控制器
+│   ├── gateway/main.go           # 接入层装配层：鉴权 / 配额 / 限流 / HTTP
+│   └── sweeper/main.go           # 泄漏对账的一次性入口（CronJob）
 ├── internal/
-│   ├── controller/               # NextPhase 纯函数 + SandboxReconciler + tiers
+│   ├── controller/               # NextPhase 纯函数 + Sandbox/Pool 控制器 + 认领绑定 + Finalizer 链
+│   ├── gateway/                  # 路由 / 错误语义 / HMAC 接入令牌 / 配额 / 限流 / 指标
+│   ├── claim/                    # CAS 认领协议
+│   ├── sweeper/                  # 泄漏对账（Classify 纯函数 + 快照 + 动作执行）
 │   └── isolation/                # 隔离级别抽象层（配置校验 + 降级策略 + 探测）
 ├── config/
 │   ├── crd/                      # 生成的 CRD 清单 + kustomization
 │   ├── isolation/                # levels.yaml（隔离级别的唯一配置入口）+ ConfigMap
 │   ├── rbac/                     # 最小权限 RBAC，兼当可执行安全基线
+│   ├── manager/                  # 控制面 Operator（Deployment / 指标 Service / PDB）
+│   ├── gateway/                  # 接入层 Deployment / Service / PDB
+│   ├── sweeper/                  # 对账 CronJob
 │   └── samples/                  # 命名空间 / 模板 / 池 / 沙箱示例
 ├── hack/
 │   ├── kind-config.yaml          # E1 集群配置
 │   ├── smoke/                    # Kata / 网络策略冒烟用例
 │   ├── bootstrap/                # 节点初始化与 KVM/vsock 自检
 │   └── verify.ps1                # Windows 验证入口
+├── test/envtest/                 # 进程内控制面（etcd + kube-apiserver），不需要 Docker
 ├── docs/                         # 设计文档 01–10
-├── Makefile                      # Linux / CI 验证入口
+├── Makefile                      # Linux / CI 验证与镜像构建入口
 └── go.mod  go.sum
 ```
 
-**规划中（M1）**：`cmd/gateway`、`cmd/node-agent`、`internal/claim`（CAS 认领协议）、
-`internal/sweeper`（泄漏对账）、`test/e2e`、`test/conformance`。
+**规划中（M1 收尾）**：`cmd/node-agent`、`template_controller`、`resource_optimizer`、
+`test/e2e`（kind 端到端）、`test/conformance`（Kata 一致性套件）、
+以及修掉 `config/manager` 那条 RBAC 缺口（PVC 权限）。
 
 ## 5. 主要功能
 

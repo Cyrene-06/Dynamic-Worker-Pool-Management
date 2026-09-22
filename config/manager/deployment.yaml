@@ -1,0 +1,156 @@
+# 控制面 Operator（sandbox-operator）。
+#
+# ⚠️ 状态说明（必须写清楚，否则"有清单"很容易被读成"已经跑通"）：
+#
+#   1. 这份清单已用 `kubectl kustomize` 渲染验证，**没有**在真实集群上部署验证过。
+#
+#   2. PVC 权限已补齐，但**作用域是三处耦合的**：volume finalizer
+#      （internal/controller/finalizers.go 的 finalizeVolumeCleanup）需要 List/Delete
+#      PersistentVolumeClaim；权限来自 config/rbac/operator-sandbox-namespace.yaml
+#      里的 namespaced Role（刻意不是 ClusterRole）；缓存也在 cmd/operator/main.go
+#      里按命名空间收窄。三处的命名空间必须一致：本文件的 `--namespace`、
+#      那份 Role/RoleBinding 的 namespace、以及收窄缓存用的那个值。
+#      不一致的症状是 403（forbidden）而不是退化成空列表 —— 这是刻意的方向。
+#      —— 这处曾经真的漏过：本地 `go run` 用开发者 kubeconfig（通常是
+#      cluster-admin）跑不出问题，一进集群才暴露（docs/10 R17）。
+#
+#   3. 9443 端口刻意**不**暴露：controller-runtime 只在首次调用
+#      mgr.GetWebhookServer() 时把 webhook 服务加入运行组（内部是
+#      webhookServerOnce），而本项目从未注册 webhook —— 也就是说现在没有任何
+#      东西在监听 9443。把端口写上只会让扫描器看到一个空端口。
+#      M2 引入 webhook 时必须同时补上：容器端口、证书卷（cert-manager 注入到
+#      /tmp/k8s-webhook-server/serving-certs）、以及对应的 Service。
+#
+#   4. 部署顺序：先 `kubectl apply -k config/rbac`（ServiceAccount + 权限）、
+#      `kubectl apply -k config/isolation`（隔离级别的运行时事实来源）、
+#      再 apply 本目录。顺序反了不会立刻报错，但控制器会用内置默认配置跑
+#      （能启动、也能收敛，只是"集群里到底哪个隔离级别可用"这个事实是错的）。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-operator
+  namespace: sandbox-system
+  labels:
+    app: sandbox-operator
+    sandbox.example.com/role: operator
+spec:
+  # 2 个副本 + leader election：主副本做决策，从副本待命。
+  # 这不是为了吞吐 —— 池决策是全局的，并发执行会让多个 goroutine 各自看到
+  # 同一个水位缺口并各自扩容（docs/09 §4），所以池控制器固定 concurrency=1。
+  # 多副本的价值只有一个：主副本所在的节点出问题时，控制面能在 15 秒内
+  # 重新出现，而不是等滚动升级或人工介入。
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sandbox-operator
+  template:
+    metadata:
+      labels:
+        app: sandbox-operator
+        sandbox.example.com/role: operator
+    spec:
+      serviceAccountName: sandbox-operator
+      # 宽限期只需要覆盖"停止 runnable + 关闭监听"。刻意**不**指望在这一步
+      # 释放 leader 租约：main.go 没有设置 LeaderElectionReleaseOnCancel
+      # （它要求收到取消后立刻退出进程，而本项目还有 finalizer 清理在跑，
+      # 那个前提不成立）。因此新 leader 要等租约过期（默认 15s）才接管。
+      # 这是刻意的取舍：宁愿切换慢 15 秒，也不要出现两个 leader 同时决策。
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          # 与 Makefile 的 OPERATOR_IMAGE 同名同 tag（make docker-build）。
+          # 上线时必须换成不可变 tag 或 digest。
+          image: ghcr.io/cyrene-06/dwp-operator:dev
+          args:
+            - --leader-elect=true
+            - --namespace=sandbox-pool
+            # 沙箱控制器的并发度可以给大：单沙箱决策彼此独立，
+            # 与池控制器"必须保持低并发"的理由正好相反（docs/09 §4）。
+            - --sandbox-concurrency=32
+            - --metrics-bind-address=:8080
+            - --health-probe-bind-address=:8081
+            # 刻意**不**传 --isolation-config：在集群内隔离配置必须来自
+            # ConfigMap（config/isolation 生成的 sandbox-isolation）。
+            # 传一个本地文件路径会把"运行时事实来源"变成镜像里的一个文件 ——
+            # 那意味着改隔离级别要重新构建并发布镜像，而这件事本该是一次配置变更。
+          ports:
+            - name: metrics
+              containerPort: 8080
+            - name: probe
+              containerPort: 8081
+          # 就绪探针用的是 healthz.Ping（见 cmd/operator/main.go），
+          # 它只证明"进程还活着、HTTP 服务在响应"，**不**证明缓存已同步。
+          # 也就是说：Ready 早于缓存同步是正常现象，滚动升级期间新 Pod 会先
+          # Ready 再开始出决策。把探针做重（等缓存）会让首次部署在 API Server
+          # 抖动时直接失败，代价比"早几十毫秒 Ready"大得多。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probe
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probe
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            # 内存上限与**被缓存的对象数量**同阶：缓存里是全部 AgentSandbox /
+            # SandboxPool / SandboxTemplate，加上沙箱命名空间内的 Lease，
+            # 加上带 role 标签的 Pod（cmd/operator/main.go 里刻意收窄了缓存范围）。
+            # 因此调池规模时这里必须一起复核，否则会以 OOMKilled 的形式
+            # 在"池扩容成功之后"才暴露 —— 那是排查成本最高的一种顺序。
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            # 控制器不写本地磁盘：没有 webhook 证书目录、不落地任何状态
+            # （状态外置是 M2 的对象存储，不是本地文件）。只读根文件系统
+            # 因此不带来任何功能损失，却挡掉一整类"运行时被写入"的攻击面。
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# 指标端点。给 Prometheus 一个**稳定的**抓取目标。
+#
+# 用 Service 而不是 PodMonitor/ServiceMonitor：后者是特定监控栈的 CRD，
+# 装上就等于把本项目的可观测性绑死在那个栈上。一个 ClusterIP Service
+# 在任何栈里都能被当作抓取目标，代价只是多一次手工配置。
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-operator-metrics
+  namespace: sandbox-system
+  labels:
+    app: sandbox-operator
+    sandbox.example.com/role: operator
+spec:
+  selector:
+    app: sandbox-operator
+  ports:
+    - name: metrics
+      port: 8080
+      targetPort: metrics
+---
+# 节点维护/滚动升级时至少保留 1 个副本：0 个副本意味着没有任何东西在维持
+# 池水位，而池干涸是**业务可见**的故障（新申请全部走冷路径或直接失败），
+# 与"已有沙箱不受影响"的降级完全不同。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sandbox-operator
+  namespace: sandbox-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sandbox-operator

@@ -28,23 +28,31 @@ helm install cilium cilium/cilium -n kube-system --set kubeProxyReplacement=true
 # 3. 安装 cert-manager（Webhook 证书）
 helm install cert-manager jetstack/cert-manager -n cert-manager --set installCRDs=true
 
-# 4. 安装 CRD + Operator（本地 overlay）
+# 4. 构建业务组件镜像并加载进 kind
+#    kind 的"节点"是容器，看不到本机 docker 的镜像缓存 —— 不做这一步会一直 ImagePullBackOff
+make docker-build        # 三个镜像共用一个 Dockerfile，见 README §2.8
+make kind-load           # 不经过任何 registry
+
+# 5. 安装 CRD + Operator（本地 overlay）
 make install
 make deploy OVERLAY=local
 
-# 5. 应用示例模板与池
+# 6. 应用示例模板与池
 kubectl apply -k config/samples/local
 
-# 6. 冒烟测试
+# 7. 冒烟测试
 make e2e-local          # 走 simulated 隔离，验证申请/回收/泄漏
 
-# 7. 观察
+# 8. 观察
 kubectl get sandboxpool fc-small -w
 kubectl get agentsandbox -n sandbox-pool -w
 ```
 
-**本地 overlay 的关键配置**：
+> **镜像与运行时自检（Windows）**：容器运行时不可用时，先用 `hack/docker-doctor.ps1`
+> 定位是**哪一层**坏了 —— CLI、守护进程、Docker Desktop 服务、WSL 还是虚拟化特性。
+> 这四类问题的表面症状都是“docker 用不了”，但修复动作完全不同。
 
+**本地 overlay 的关键配置**：
 ```yaml
 # config/overlays/local/isolation-patch.yaml
 isolation:
@@ -74,6 +82,11 @@ sweeper:
 > **结论**：本地验证**正确性**（逻辑对不对），生产验证**性能与安全**（数字与边界）。不要把本地的延迟/密度数字写进 SLO 依据。
 
 ## 3. 生产安装顺序（依赖关系严格）
+
+> **镜像前提**：第 9 / 10 / 12 步都要求镜像已经构建并推送。三个镜像由仓库根目录的
+> 单个 `Dockerfile` 产出（`make docker-build docker-push`，多架构用 `make docker-buildx`，
+> 见 [README §2.8](../README.md)）。生产上必须用**不可变 tag 或 digest**：
+> 用浮动 tag 时“回滚”会退化成“重新部署一次未知内容”，而事故处理最不需要这种不确定性。
 
 ```mermaid
 flowchart TD
@@ -131,6 +144,8 @@ flowchart TD
 
 ```
 .
+├── Dockerfile                    # operator / gateway / sweeper 共用（多阶段 + distroless）
+├── .dockerignore
 ├── api/v1alpha1/                 # CRD 类型定义（kubebuilder）
 ├── cmd/
 │   ├── operator/main.go

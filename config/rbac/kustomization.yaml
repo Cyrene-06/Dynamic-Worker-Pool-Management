@@ -9,3 +9,6 @@ kind: Kustomization
 resources:
   - rbac.yaml
   - gateway-sweeper.yaml
+  # 单独一份：它是唯一按**命名空间**授权的地方（Role 而不是 ClusterRole），
+  # 因为 Operator 只需要在它管理的沙箱命名空间里清理数据卷。
+  - operator-sandbox-namespace.yaml

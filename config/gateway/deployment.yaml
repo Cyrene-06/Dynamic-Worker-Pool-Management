@@ -1,9 +1,11 @@
 # 业务接入层（sandbox-gateway）。
 #
-# ⚠️ 镜像尚未构建：本仓库还没有 Dockerfile，因为当前开发机没有可用的容器
-# 运行时（Docker Desktop 未初始化、WSL2 未启用）。这份清单已用
-# `kubectl kustomize` 渲染验证，但**没有**在真实集群上部署验证过。
-# 这一点必须说清楚，否则"有清单"很容易被读成"已经跑通"。
+# ⚠️ 状态说明（必须写清楚，否则"有清单"很容易被读成"已经跑通"）：
+#   1. 这份清单已用 `kubectl kustomize` 渲染验证，但**没有**在真实集群上部署验证过。
+#   2. 镜像由仓库根目录的 Dockerfile 构建（`make docker-build` /
+#      `make kind-load`，构建细节见 README §2.8）。
+#      **构建本身也还没有被真正执行过**：当前开发机的容器运行时不可用
+#      （Docker Desktop 已装但 Linux 引擎未初始化），见 README §2.6。
 #
 # ⚠️ 上线前必须手工创建 Secret `sandbox-gateway-auth`（两个键：
 # tenant-tokens、issuer-secret）。它**不在**仓库里，示例见同目录的
@@ -39,7 +41,11 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gateway
-          # 上线时必须替换为真实镜像（含不可变 tag/digest）。
+          # 与 Makefile 的 GATEWAY_IMAGE 同名同 tag（make docker-build）。
+          # `:dev` 只是本地/kind 用的标签：kind load 进去的镜像不在任何 registry 里，
+          # 而 kubelet 对非 `:latest` 标签默认 IfNotPresent，正好不会去远端拉。
+          # 上线时必须换成**不可变** tag 或 digest（sha256:...）—— 浮动标签会让
+          # "回滚"退化成"重新部署一次未知内容"，而那正是事故处理时最不需要的不确定性。
           image: ghcr.io/cyrene-06/dwp-gateway:dev
           args:
             - --bind-address=:8090
