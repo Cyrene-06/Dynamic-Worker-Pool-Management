@@ -159,7 +159,14 @@ make deploy-local
 
 > Windows 上没有 make 时，用等价入口：
 > `powershell -ExecutionPolicy Bypass -File hack/verify.ps1`
-> （支持 `-Task verify|fmt|vet|build|test|manifests|generate`）
+> （支持 `-Task verify|fmt|vet|build|test|manifests|generate|cleanup`）
+>
+> ⚠️ **Windows 上 envtest 会泄漏控制面进程**（已实测）：测试二进制被强杀时
+> （Defender 占用 `*.test.exe`、Ctrl+C、超时），它启动的 etcd / kube-apiserver
+> **不会被回收**，累积起来很可观 —— 一轮 `verify` 可能攒下 3–6 GB 内存，
+> 而表象是“机器内存不够”或“什么都变慢了”。`verify` 末尾会自动清理，
+> 也可单独跑 `-Task cleanup`。清理只针对可执行文件路径含 `sandbox-tools\envtest`
+> 的进程，**不会碰真实集群**（kind / kubeadm）。
 
 > **envtest 说明**：`make test-envtest` 会调用 `setup-envtest` 下载并缓存 etcd / kube-apiserver 二进制，
 > **完全不需要 Docker**（与 kind 不同）。未设置 `KUBEBUILDER_ASSETS` 时，`internal/claim` 的集成测试会

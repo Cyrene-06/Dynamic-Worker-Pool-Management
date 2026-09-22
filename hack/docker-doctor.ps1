@@ -292,8 +292,14 @@ foreach ($name in 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform')
             Write-OK "$name : enabled (InstallState=2)"
             $script:featuresEnabled = $true
         }
-        3 { Write-Bad "$name : DISABLED (InstallState=3) -- enable it in an ADMIN shell." }
-        1 { Write-Bad "$name : not installed (InstallState=1) -- enable it in an ADMIN shell." }
+        3 {
+            Write-Bad "$name : DISABLED (InstallState=3) -- enable it in an ADMIN shell."
+            $script:featuresMissing = $true
+        }
+        1 {
+            Write-Bad "$name : not installed (InstallState=1) -- enable it in an ADMIN shell."
+            $script:featuresMissing = $true
+        }
         default { Write-Warn "$name : state unknown (verify with elevated DISM /online /get-featureinfo)." }
     }
 }
@@ -352,14 +358,27 @@ Write-Host ''
 
 $step = 1
 
-if ($script:rebootPending) {
-    Write-Host "  $step. REBOOT FIRST." -ForegroundColor Cyan
-    Write-Host '     The WSL/VirtualMachinePlatform feature flags are already enabled, but a'
-    Write-Host '     reboot is pending -- enabled-but-not-active is exactly the state where'
-    Write-Host '     wsl.exe and Docker Desktop both report "not installed".'
-    Write-Host '     If the features were NOT enabled, enable them first (admin), then reboot:'
-    Write-Host '       DISM /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart'
+# Order the advice by what is ACTUALLY missing. Reporting "reboot first because the
+# features are already enabled" was wrong on this machine after a reboot: the
+# VirtualMachinePlatform feature had gone back to 'not installed' (InstallState=1),
+# so the reboot could not possibly have helped. Check the feature state first.
+if ($script:featuresMissing) {
+    Write-Host "  $step. Enable the missing Windows features (ADMIN PowerShell), then REBOOT." -ForegroundColor Cyan
+    Write-Host '     Without VirtualMachinePlatform there is no hns/vmcompute, no running'
+    Write-Host '     hypervisor, and therefore no WSL2 distro and no Docker engine --'
+    Write-Host '     the WSL runtime being installed is NOT enough on its own:'
     Write-Host '       DISM /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart'
+    Write-Host '       DISM /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart'
+    Write-Host '     Then reboot (a reboot is the only way a feature change takes effect).'
+    Write-Host '     Optional sanity check of the real servicing state (admin):'
+    Write-Host '       DISM /online /get-featureinfo /featurename:VirtualMachinePlatform'
+    Write-Host ''
+    $step++
+} elseif ($script:rebootPending) {
+    Write-Host "  $step. REBOOT FIRST." -ForegroundColor Cyan
+    Write-Host '     The required features are enabled but a reboot is pending, and an'
+    Write-Host '     enabled-but-not-active feature looks exactly like a missing one from'
+    Write-Host '     the outside: no hns, no vmcompute, no distro.'
     Write-Host ''
     $step++
 }

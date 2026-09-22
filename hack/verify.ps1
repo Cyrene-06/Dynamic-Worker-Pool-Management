@@ -16,7 +16,7 @@
 # Toolchain resolution: $env:LOCALAPPDATA\sandbox-tools first, then whatever is on PATH.
 
 param(
-    [ValidateSet('verify', 'fmt', 'fmt-check', 'vet', 'build', 'test', 'cover', 'manifests', 'generate')]
+    [ValidateSet('verify', 'fmt', 'fmt-check', 'vet', 'build', 'test', 'cover', 'manifests', 'generate', 'cleanup')]
     [string]$Task = 'verify'
 )
 
@@ -78,6 +78,28 @@ function Invoke-Generate {
     controller-gen object:headerFile=hack/boilerplate.go.txt paths=./api/v1alpha1
 }
 
+function Clear-StrayEnvtest {
+    # envtest starts one etcd + one kube-apiserver per suite. When a test binary is
+    # killed instead of exiting cleanly (Defender file locks on *.test.exe,
+    # Ctrl+C, a timeout), those children are NOT reaped and they accumulate
+    # silently: one working session on this machine reached 36 etcd + 34
+    # kube-apiserver, about 6 GB of RAM, which then looked like "the machine is
+    # out of memory" rather than "a test leaked processes".
+    #
+    # The filter matters: only processes whose executable lives under the
+    # project's envtest asset directory are touched, so a real local cluster
+    # (kind / kubeadm / a colleague's control plane) can never be hit.
+    $stale = Get-Process etcd, kube-apiserver -ErrorAction SilentlyContinue |
+        Where-Object { try { $_.Path -like '*sandbox-tools\envtest*' } catch { $false } }
+    if (-not $stale) {
+        Write-Host 'no stray envtest processes.'
+        return
+    }
+    $mb = [int]((($stale | Measure-Object -Property WorkingSet64 -Sum).Sum) / 1MB)
+    Write-Host "stopping $($stale.Count) stray envtest processes (~$mb MB)"
+    $stale | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 switch ($Task) {
     'fmt'         { Invoke-Fmt }
     'fmt-check'   { Invoke-Step 'fmt-check' { Invoke-FmtCheck } }
@@ -87,11 +109,15 @@ switch ($Task) {
     'cover'       { Invoke-Step 'cover' { go test ./... -count=1 -coverprofile=cover.out; go tool cover -func=cover.out | Select-Object -Last 1 } }
     'manifests'   { Invoke-Step 'manifests' { Invoke-Manifests } }
     'generate'    { Invoke-Step 'generate' { Invoke-Generate } }
+    'cleanup'     { Invoke-Step 'cleanup' { Clear-StrayEnvtest } }
     'verify' {
         Invoke-Step 'fmt-check' { Invoke-FmtCheck }
         Invoke-Step 'vet'       { go vet ./... }
         Invoke-Step 'build'     { go build ./... }
         Invoke-Step 'test'      { go test ./... -count=1 }
+        # Always last: a clean run leaves nothing behind, but a run that was
+        # interrupted must not leave 6 GB of control planes running.
+        Invoke-Step 'cleanup'   { Clear-StrayEnvtest }
     }
 }
 
