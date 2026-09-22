@@ -1,0 +1,84 @@
+# 泄漏对账（sweeper）的 CronJob。
+#
+# ⚠️ 首次上线、以及**每一次修改了对账规则之后**，都必须先跑一次 dry-run：
+#
+#   kubectl -n sandbox-system create job --from=cronjob/sandbox-sweeper sweeper-dryrun \
+#     -o yaml --dry-run=client | sed 's/--timeout=2m/--timeout=2m\n                - --dry-run/' \
+#   | kubectl apply -f -
+#
+# 之所以把它写成注释而不是提供一个自动化 make 目标：dry-run 的价值全部在于
+# "有人真的读了一遍报告"。把它自动化，那一步就会被跳过 ——
+# 而它正是这个机制存在的意义。
+#
+# # 为什么是对账，而不是"把控制器写对就行"
+#
+# 状态机处理正常路径，对账处理**一切异常路径**：控制器崩溃、被重启、
+# 读到过期缓存；Finalizer 在超时后被强制推进而留下残余；etcd 恢复出
+# 引用已不存在 Pod 的对象。这些情况在代码里穷举不完，只能靠定期核对兜底。
+# docs/04 §6.3 的"泄漏率 0"目标，实际保障就是这条链路。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: sandbox-sweeper
+  namespace: sandbox-system
+  labels:
+    app: sandbox-sweeper
+    sandbox.example.com/role: sweeper
+spec:
+  # 每 5 分钟一次（docs/04 §6.3）。E1 本地环境建议调到 30 秒以便测试，
+  # 对应 docs/09 §2 的 sweeper.intervalSeconds。
+  schedule: "*/5 * * * *"
+  # 上一轮还没结束就跳过本轮，而不是并发跑两个对账。
+  # 两个对账同时删同一批对象会产生大量 404/409 噪声，
+  # 而它掩盖的正是"到底是谁删的"这个关键问题。
+  concurrencyPolicy: Forbid
+  # 一轮都没成功过才告警：单次失败（API Server 抖动）不需要惊动人。
+  failedJobsHistoryLimit: 3
+  successfulJobsHistoryLimit: 3
+  # 不能让对账无限堆积：它绝不能活得比它的执行周期还久。
+  startingDeadlineSeconds: 120
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      # 一轮对账遍历全量对象，正常在秒级完成。给 3 分钟是留足余量；
+      # 超过它说明出了问题（API Server 严重变慢或对象数量异常），
+      # 那种情况下更应该失败退出并告警，而不是继续挂着。
+      activeDeadlineSeconds: 180
+      template:
+        metadata:
+          labels:
+            app: sandbox-sweeper
+        spec:
+          serviceAccountName: sandbox-sweeper
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: sweeper
+              # 上线时必须替换为真实镜像。
+              image: ghcr.io/cyrene-06/dwp-sweeper:dev
+              args:
+                # 阈值与 internal/sweeper.DefaultOptions 保持一致。
+                # 在这里显式写出而不是依赖代码默认值：运维需要能一眼看到
+                # 当前生效的是哪套阈值，而不是去翻代码。
+                - --orphan-grace=5m
+                - --stuck-terminating-grace=10m
+                - --pending-grace=30m
+                # 爆炸半径上限。一个 bug 可能让对账把所有对象都判成孤儿；
+                # 有上限时最坏情况是被截断并被 Truncated 标记暴露。
+                - --max-findings=200
+                - --timeout=2m
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]

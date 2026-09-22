@@ -59,8 +59,18 @@ vet: ## 静态检查
 	go vet ./...
 
 .PHONY: build
-build: ## 编译全部包
+build: ## 编译全部可执行文件（operator / gateway / sweeper）
 	go build ./...
+
+.PHONY: manifests-check
+manifests-check: ## 校验全部 kustomize 清单可渲染（不需要集群）
+	kubectl kustomize config/crd > /dev/null
+	kubectl kustomize config/rbac > /dev/null
+	kubectl kustomize config/isolation > /dev/null
+	kubectl kustomize config/samples > /dev/null
+	kubectl kustomize config/gateway > /dev/null
+	kubectl kustomize config/sweeper > /dev/null
+	@echo "all manifests render OK"
 
 .PHONY: test
 test: ## 单元测试（纯函数；若已设 KUBEBUILDER_ASSETS 则一并跑 envtest 集成测试，否则自动 skip）
@@ -104,12 +114,34 @@ install: manifests ## 安装 CRD
 
 .PHONY: deploy-local
 deploy-local: install ## 部署到本地集群（simulated 隔离）
+	kubectl apply -k config/rbac
 	kubectl apply -k config/isolation
 	kubectl apply -k config/samples
 	go run ./cmd/operator --isolation-config=config/isolation/levels.yaml --leader-elect=false
 
+.PHONY: gateway-local
+gateway-local: ## 本地运行接入层（需要 SANDBOX_TOKEN_ISSUER_SECRET 环境变量）
+	go run ./cmd/gateway --tenant-tokens-file=config/gateway/tenant-tokens.example \
+		--sandbox-namespace=sandbox-pool --bind-address=:8090
+
+.PHONY: sweeper-local
+sweeper-local: ## 本地干跑一轮对账（只报告不执行）
+	go run ./cmd/sweeper --dry-run
+
+.PHONY: deploy-gateway
+deploy-gateway: ## 部署接入层（需先手工创建 Secret sandbox-gateway-auth）
+	kubectl apply -k config/rbac
+	kubectl apply -k config/gateway
+
+.PHONY: deploy-sweeper
+deploy-sweeper: ## 部署泄漏对账 CronJob
+	kubectl apply -k config/rbac
+	kubectl apply -k config/sweeper
+
 .PHONY: undeploy
 undeploy: ## 卸载示例资源（保留 CRD）
+	-kubectl delete -k config/sweeper --ignore-not-found
+	-kubectl delete -k config/gateway --ignore-not-found
 	-kubectl delete -k config/samples --ignore-not-found
 	-kubectl delete -k config/isolation --ignore-not-found
 

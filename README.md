@@ -217,10 +217,56 @@ kubectl apply -f hack/smoke/kata-fc-pod.yaml
 kubectl exec -it kata-smoke -- uname -r
 ```
 
-### 2.5 VSCode 工作区
+### 2.5 接入层（gateway）与泄漏对账（sweeper）
+
+```bash
+# 接入层：业务唯一入口（申请/续租/释放/查询）
+# 签名密钥从环境变量取，避免它出现在 ps 输出与 kubectl describe 里
+export SANDBOX_TOKEN_ISSUER_SECRET=$(openssl rand -hex 32)
+make gateway-local
+
+# 热路径申请（命中池中库存）
+curl -sS -X POST localhost:8090/v1/sandboxes \
+  -H "Authorization: Bearer <你的租户令牌>" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"pool":"fc-small","ttlSeconds":600}'
+
+# 对账：先干跑（只报告不执行），确认报告合理后再实跑
+make sweeper-local
+```
+
+> **幂等键是可选的，但含义完全不同**：提供 `Idempotency-Key` 时同一键只产生一次认领
+> （重试安全）；不提供时每次请求都是新的申请，**重试会拿到两个沙箱**。
+>
+> **错误语义是 API 最重要的部分**：`409` = 竞争激烈、库存可能还在，应当**立即**重试；
+> `503` + `Retry-After` = 池确实空了，应当退避或降级；`410` + `recycleReason` = 已被回收，
+> 应当重建并恢复状态；`422` = 参数不对，**不要**重试。把 409 与 503 混为一谈会让业务
+> 在池里还有库存时去走冷路径（白花一次冷启动，并让命中率指标偏低）。
+
+### 2.6 尚未被验证的边界
+
+这一节是刻意保留的。把它删掉，下面的东西就会被读成"已经好了"。
+
+| 能力 | 状态 | 缺少什么才能验证 |
+|---|---|---|
+| CRD 状态机 / 认领 CAS / 池水位算法 | ✅ 有单测与 envtest，含并发冲突实测 | — |
+| 接入层全部路由与错误语义 | ✅ httptest + envtest（真实 API Server） | — |
+| 泄漏对账的判断逻辑 | ✅ 纯函数穷举测试 | — |
+| 运营商清单（gateway / sweeper） | ⚠️ 仅用 `kubectl kustomize` 渲染验证过 | 一个真集群 + 镜像 |
+| 容器镜像 | ❌ 仓库里还没有 Dockerfile | 可用的容器运行时（本机 Docker Desktop 未初始化、WSL2 未启用） |
+| kind 端到端（申请→认领→回收全链） | ❌ 未跑通 | 同上 |
+| Kata / Firecracker 真实隔离、启动延迟、cgroup 冻结 | ❌ 本机物理上做不到 | 带 `/dev/kvm` 的 Linux 节点（本机无 KVM） |
+| 接入令牌的**强制** | ❌ 数据面代理尚未实现 | 一个校验令牌的连接代理；在那之前它只是一份凭据，不是一道防线 |
+| 状态落盘（L3） | ❌ 默认 `DisabledFlusher`，启用 externalize 时会**明确报错** | 对象存储接入（M2） |
+
+> 最后两行特别值得注意：它们都是"已经存在看起来很完整的接口、但背后没有真正的执行者"。
+> 本项目的处理方式是让它们**显式失败或显式写明**，而不是静默成功 ——
+> 静默成功会让问题在业务侧以"数据丢了/被攻破了"的形式出现，而那时已经无从定位。
+
+### 2.7 VSCode 工作区
 
 - **开发**：使用 VS Code 打开仓库根目录，`Go` 扩展会自动加载 `go.mod`；`config/` 下是 Kustomize 清单（`crd` / `isolation` / `rbac` / `samples`）。
-- **运行/调试**：`.vscode/launch.json` 提供 `Operator` 调试配置（`simulated` 隔离，对接本地 kubeconfig）；`Gateway` / `Both` 配置随 M1 的接入层一起补齐。
+- **运行/调试**：`.vscode/launch.json` 提供 `Operator`、`Gateway`、`Sweeper（干跑一轮）` 三个配置；`Both`（同时起控制面与接入层）需要两个进程共享一个 kubeconfig，请用两个 VS Code 窗口，或直接用 `make gateway-local`。
 - **settings**：`.vscode/settings.json` 中的 `go.toolsEnvVars` 用于 VS Code 自身 Go 工具的环境变量。
   **本项目不提交任何绝对路径**（如 `KUBEBUILDER_ASSETS`）—— 它随机器而异，写进仓库必然在别人机器上失效；
   请改为在自己的 shell 或用户级配置中设置。
@@ -398,33 +444,7 @@ stateDiagram-v2
 - **网络与节点**：[Cilium Network Policy](https://docs.cilium.io/en/stable/security/policy/)、[Karpenter](https://karpenter.sh/docs/)
 - **资源效率**：[Vertical Pod Autoscaler](https://github.com/kubernetes/autoscaler/tree/master/vertical-pod-autoscaler)、[Kubernetes 调度器插件](https://github.com/kubernetes-sigs/scheduler-plugins)
 
-## 7. 联系方式
 
-- **问题反馈**: 提交 GitHub Issue（模板见 [1.2.1](#121-issue-规范)）
-- **设计讨论**: GitHub Discussions
-- **安全漏洞**: 请勿公开提交 Issue，通过私下渠道向维护者披露（后续补充 `SECURITY.md`）
-- **交流群**: 待建立
-
-## 8. 贡献者
-
-感谢每一位为本项目提交设计修正、反例与实测数据的人。
-
-贡献者名单与贡献排行将随首个代码里程碑公布（可参考 GitHub 仓库的 Contributors 页面）。
-
-## 9. 支持我们
-
-如果这套设计对你有帮助，欢迎：
-
-- ⭐ **Star** 本仓库，让更多做 Agent 平台的人看到；
-- 🐛 提交你在落地过程中遇到的**反例**与**踩坑记录**（这比通用文档更有价值）；
-- 📝 提交 PR 修正公式、参数或性能数字（需附依据）。
-
-## 10. 注意事项
-
-1. 使用、修改和分发本仓库内容时，请遵循仓库中的 `LICENSE`，并保留许可证要求的适用声明。仓库尚未包含 `LICENSE` 文件，将于首个代码里程碑补齐。
-2. 文档中的所有性能与容量数字均为**设计目标或量级参考**，不是实测承诺。生产决策前请以自建压测基线为准。
-3. 本项目不提供 SLA 承诺；若需商业支持请联系维护者。
-4. 文中提及的第三方项目与商标（Kubernetes® 归 CNCF 所有、Kata Containers 归 OpenInfra Foundation、Firecracker 归 Amazon、Cilium 归 Isovalent 等）归各自所有者所有，本项目与它们无从属关系。
 
 <br>
 

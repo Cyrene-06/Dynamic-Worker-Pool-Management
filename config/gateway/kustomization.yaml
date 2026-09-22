@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 接入层清单。注意它**依赖** config/rbac 里的 ServiceAccount 与 ClusterRole，
+# 因此部署顺序是：先 `kubectl apply -k config/rbac`，再 apply 本目录。
+#
+# 不在这里 resources 里包含 ../rbac：那会让 "改 RBAC" 与 "改 Deployment"
+# 变成同一次 apply，而 RBAC 变更需要走安全评审。分开是刻意的。
+resources:
+  - deployment.yaml

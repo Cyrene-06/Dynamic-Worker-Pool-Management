@@ -35,6 +35,15 @@ type Observation struct {
 	// LeaseHealthy 表示心跳仍在有效期内（Lease 未过期 + 已过 grace）。
 	LeaseHealthy bool
 
+	// LastLeaseRenewAt 是心跳 Lease 最近一次续租时间。
+	//
+	// 它同时承担两个职责，这也是它必须进入 Observation 的原因：
+	//  1. 它是**唯一**由客户端主动产生的活性信号 —— 节点侧活动采集（M2）
+	//     尚未落地时，这是空闲判定唯一可用的依据；
+	//  2. 它让"续租"真正生效：不把续租算作活动，客户端即使每 20s 续租一次，
+	//     仍会在 idleTimeout 后被当作空闲回收。
+	LastLeaseRenewAt time.Time
+
 	// ---- 活动（辅助判据）----
 	// 这三个信号用于处理"心跳丢失但沙箱确实在被使用"的矛盾情况。
 	// 此时必须保守地选择"不回收"（docs/03 §4.3）。
@@ -45,6 +54,15 @@ type Observation struct {
 	// ---- 休眠相关 ----
 	Frozen  bool // 冻结/快照已完成
 	Resumed bool // 唤醒已完成
+
+	// ---- 人工干预 ----
+	//
+	// 这两个值来自 gateway 写入的注解，是单向契约：gateway 写、控制器只读。
+	// 解除请求也由 gateway 完成（:wake 同时清掉 hibernate 标记），
+	// 而不是由控制器在动作完成后回写 —— 否则就变成两个写入者，
+	// 而它们互相覆盖是这类 bug 最常见的成因。
+	ManualWake      bool
+	ManualHibernate bool
 }
 
 // ConditionReason 是决策原因码。
@@ -124,11 +142,32 @@ func ReclaimDecision(phase sandboxv1alpha1.Phase, reason ConditionReason, why sa
 	}
 }
 
-// NextPhase 是状态机的唯一决策点。
+// NextPhase 是状态机的唯一决策点，使用"仅由沙箱自身推导"的生命周期参数。
 //
 // 它是纯函数：不读集群、不写集群、不看时钟（时间来自 Observation）。
 // 因此可以被完整穷举测试，也因此在被调用上千次时结果稳定。
+//
+// 需要用到 SandboxTemplate 默认值（如 maxClaimCount）的调用方应当用
+// NextPhaseWithLifecycle，并把 ApplyTemplateDefaults 的结果传进去。
+// 两段式而不是把模板作为参数塞进来：后者会让这个纯函数的入参多一个
+// 需要 IO 才能拿到的对象，而它的价值恰恰来自不需要 IO。
 func NextPhase(sbx *sandboxv1alpha1.AgentSandbox, o Observation) Decision {
+	return NextPhaseWithLifecycle(sbx, EffectiveLifecycle(sbx), o)
+}
+
+// NextPhaseWithLifecycle 用**调用方给定的**生命周期参数做决策。
+//
+// # 为什么必须能传入而不是内部重算
+//
+// 原实现内部调用 EffectiveLifecycle(sbx)，而它只能看到沙箱自身。
+// 于是任何来自 SandboxTemplate 的取值（maxClaimCount、模板级空闲阈值）
+// 在状态机里都会被重算成零值 —— 表现出来就是"模板里配了 maxClaimCount，
+// 但库存永远不会轮换"，而且配置看起来完全正确，没有任何线索。
+func NextPhaseWithLifecycle(
+	sbx *sandboxv1alpha1.AgentSandbox,
+	lc Lifecycle,
+	o Observation,
+) Decision {
 	if sbx == nil {
 		return Decision{Reason: ReasonUnexpectedPhase}
 	}
@@ -139,8 +178,6 @@ func NextPhase(sbx *sandboxv1alpha1.AgentSandbox, o Observation) Decision {
 	if sbx.Status.Phase.IsTerminal() {
 		return Decision{Reason: ReasonTerminal}
 	}
-
-	lc := EffectiveLifecycle(sbx)
 
 	switch sbx.Status.Phase {
 	case "", sandboxv1alpha1.PhasePending:
@@ -172,7 +209,7 @@ func NextPhase(sbx *sandboxv1alpha1.AgentSandbox, o Observation) Decision {
 			d.Next = sandboxv1alpha1.PhaseTerminating
 			return d
 		}
-		if activityObserved(lc, o) {
+		if activityObserved(lc, o) || o.ManualWake {
 			return Decision{Next: sandboxv1alpha1.PhaseResuming, Reason: ReasonResuming}
 		}
 		// 冻结只释放了 CPU，内存仍在占用。若已达回收阈值就必须真正销毁，
@@ -208,6 +245,19 @@ func decideProvisioning(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Obser
 		return ReclaimDecision(sandboxv1alpha1.PhaseFailed, ReasonNodeLost,
 			sandboxv1alpha1.RecycleNodeLost)
 	}
+
+	// 超时判定必须放在所有"继续等待"分支**之前**。
+	//
+	// 原实现把它写在PodPending的 default 分支里，于是两条最需要兜底的路径
+	// 反而没有超时：Pod 始终没被创建（PodExists=false），以及 Pod 起了但
+	// 就绪探针永不通过。这两种情况下状态机会无限返回 Stay，
+	// 表现出来就是"沙箱一直卡在 Provisioning"，而且没有任何报错、
+	// 没有任何告警 —— 它看起来只是在等。
+	if provisionTimedOut(sbx, lc, o) {
+		return ReclaimDecision(sandboxv1alpha1.PhaseFailed, ReasonProvisionTimeout,
+			sandboxv1alpha1.RecycleRuntimeError)
+	}
+
 	if !o.PodExists {
 		// Pod 可能正在被创建，也可能被人手删了。两种都以"等待 + 超时兜底"处理，
 		// 不做猜测 —— 猜测会导致同一状态在不同时间产生不同结果。
@@ -232,11 +282,7 @@ func decideProvisioning(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Obser
 			sandboxv1alpha1.RecycleRuntimeError)
 
 	default:
-		// PodPending（调度中）等中间态。
-		if provisionTimedOut(sbx, lc, o) {
-			return ReclaimDecision(sandboxv1alpha1.PhaseFailed, ReasonProvisionTimeout,
-				sandboxv1alpha1.RecycleRuntimeError)
-		}
+		// PodPending（调度中）等中间态，等待并由上方的超时兜底。
 		return Stay(ReasonWaitingPodReady, 2*time.Second)
 	}
 }
@@ -257,6 +303,18 @@ func decideStock(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Observation)
 	if stockTooOld(lc, sbx, o) {
 		return ReclaimDecision(sandboxv1alpha1.PhaseTerminating, ReasonStockRotation,
 			sandboxv1alpha1.RecycleStockRotation)
+	}
+
+	// 复用次数上限：该实例已经服务过 maxClaimCount 次会话，不再交给下一位租户。
+	//
+	// 这是"库存轮换"的另一种触发（与年龄无关）。放在库存分支而不是认领分支，
+	// 是因为在这一刻沙箱是空闲的：回收它不会打断任何正在进行的会话。
+	// 若放到认领之后就变成"交给业务后再抢回来"。
+	// 注意这是**防御性**的：gateway 在挑选候选时也会跳过超限实例，
+	// 两处都做是因为 gateway 的候选列表来自缓存，可能滞后。
+	if reuseLimitReached(lc, sbx) {
+		return ReclaimDecision(sandboxv1alpha1.PhaseTerminating, ReasonReuseLimitReached,
+			sandboxv1alpha1.RecycleReuseLimitReached)
 	}
 
 	// 库存在池里通常等几分钟才被认领，不必秒级轮询。
@@ -336,7 +394,10 @@ func decideClaimed(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Observatio
 
 		// 6a. 冻结：一次 cgroup 写操作就能释放全部 CPU，成本极低且完全可逆。
 		//     这是本项目性价比最高的一项优化，收益通常在 70% 量级（docs/07 §5.3）。
-		if hibernateDue(lc, sbx, idle) {
+		//
+		//     人工请求也走同一分支：把"人工休眠"实现成一套独立流程，
+		//     就会有两份"什么条件下可以冻结"的规则，而它们迟早会不一致。
+		if hibernateDue(lc, sbx, idle) || o.ManualHibernate {
 			return Decision{Next: sandboxv1alpha1.PhaseHibernating, Reason: ReasonIdleHibernate}
 		}
 		// 6b. 回收。
@@ -418,13 +479,29 @@ func activityObserved(lc Lifecycle, o Observation) bool {
 // 时间判定
 // ---------------------------------------------------------------------------
 
+// idleFor 返回"距最后一次可观测活动过了多久"。
+//
+// 基准必须是"最后一次活动"，而**不是** CR 的创建时间。这个区别是致命的：
+// 池中库存完全可能躺了 1 小时才被认领，若以创建时间为基准，
+// 它会在认领后的第一次 reconcile 就被判定"已空闲 1 小时"而立即回收 ——
+// 池化（本项目最核心的机制）会以"刚认领就被销毁"的形式完全失效，
+// 而日志上只会显示一次看起来毫无异常的 IdleTimeout 回收。
+//
+// 因此取以下四者的**最大值**（即最晚的那个）：
+//   - CreationTimestamp：兜底下限，保证结果永不为负
+//   - ClaimRef.ClaimedAt：认领本身就是一次活动
+//   - Activity.LastActiveAt：节点侧观测到的活动
+//   - LastLeaseRenewAt：客户端主动续租，最强的"还活着"证据
 func idleFor(sbx *sandboxv1alpha1.AgentSandbox, o Observation) time.Duration {
 	last := sbx.CreationTimestamp.Time
-	if sbx.Status.Activity.LastActiveAt != nil {
-		last = sbx.Status.Activity.LastActiveAt.Time
-	} else if sbx.Status.ClaimRef != nil && sbx.Status.ClaimRef.ClaimedAt != nil {
-		// 认领即视为一次活动，避免"刚认领就被判空闲"。
-		last = sbx.Status.ClaimRef.ClaimedAt.Time
+	if c := sbx.Status.ClaimRef; c != nil && c.ClaimedAt != nil && c.ClaimedAt.After(last) {
+		last = c.ClaimedAt.Time
+	}
+	if a := sbx.Status.Activity.LastActiveAt; a != nil && a.After(last) {
+		last = a.Time
+	}
+	if !o.LastLeaseRenewAt.IsZero() && o.LastLeaseRenewAt.After(last) {
+		last = o.LastLeaseRenewAt
 	}
 	if o.Now.Before(last) {
 		return 0
@@ -457,6 +534,18 @@ func stockTooOld(lc Lifecycle, sbx *sandboxv1alpha1.AgentSandbox, o Observation)
 		return false
 	}
 	return o.Now.Sub(sbx.CreationTimestamp.Time) >= time.Duration(lc.MaxStockAgeSeconds)*time.Second
+}
+
+// reuseLimitReached 判断库存是否已服务过足够多次会话。
+//
+// MaxClaimCount <= 0 表示不限制（默认）。之所以默认不限：把默认值设成 1 会让
+// 所有池化收益归零（每次复用都要重建），而这是个性能开关而非安全开关 ——
+// 安全边界是 resetHook，与它无关。
+func reuseLimitReached(lc Lifecycle, sbx *sandboxv1alpha1.AgentSandbox) bool {
+	if lc.MaxClaimCount <= 0 {
+		return false
+	}
+	return sbx.Status.Metrics.ClaimedCount >= lc.MaxClaimCount
 }
 
 func provisionTimedOut(sbx *sandboxv1alpha1.AgentSandbox, lc Lifecycle, o Observation) bool {
@@ -513,6 +602,12 @@ type Lifecycle struct {
 	ReclaimPolicy                sandboxv1alpha1.ReclaimPolicy
 	TreatNetworkActivityAsActive bool
 	TreatCPUAboveMilli           int64
+	// MaxClaimCount 是同一实例允许服务多少次会话（来自 SandboxTemplate）。
+	// <=0 表示不限制。见 reuseLimitReached。
+	MaxClaimCount int32
+	// AllowSameTenantReuse 控制释放后是否允许同租户原地复用
+	// （跨租户复用恒不充许，见 docs/08 §9）。
+	AllowSameTenantReuse bool
 }
 
 // 代码里的默认值必须与 CRD 的 +kubebuilder:default 保持一致。
@@ -569,5 +664,61 @@ func EffectiveLifecycle(sbx *sandboxv1alpha1.AgentSandbox) Lifecycle {
 			lc.ReclaimPolicy = s.ReclaimPolicy
 		}
 	}
+	return lc
+}
+
+// ApplyTemplateDefaults 把 SandboxTemplate 提供的默认值合入生效参数。
+//
+// 为什么不直接写进 EffectiveLifecycle：那个函数只依赖 sbx，因此是**纯函数**，
+// 能在没有集群、没有模板对象的测试里被穷举调用。模板是另一个对象，
+// 让 EffectiveLifecycle 去读它就会把纯函数变成需要 IO 的函数 ——
+// 而状态机测试的全部价值恰恰来自"不需要集群"。
+//
+// 优先级：沙箱显式值 > 模板默认值 > 代码默认值（EffectiveLifecycle 已展开）。
+// 三者关系必须确定，否则会出现"改了模板却不生效"这种无从下手的现象。
+//
+// "显式值"的判定：spec.Lifecycle 为 nil，或对应字段为零值（字符串为空）。
+// 这对走经过 API Server 的对象是准确的：CRD 的 +kubebuilder:default 会把
+// 未填字段写成默认值，因此"零值"确实意味着用户显式写了 0。
+func ApplyTemplateDefaults(sbx *sandboxv1alpha1.AgentSandbox, tmpl *sandboxv1alpha1.SandboxTemplate) Lifecycle {
+	lc := EffectiveLifecycle(sbx)
+	if tmpl == nil {
+		return lc
+	}
+	d := tmpl.Spec.Defaults
+	spec := sbx.Spec.Lifecycle
+
+	unsetTTL := spec == nil || spec.TTLSecondsAfterCreation == 0
+	if unsetTTL && d.TTLSecondsAfterCreation > 0 {
+		lc.TTLSecondsAfterCreation = d.TTLSecondsAfterCreation
+	}
+	// IdleTimeoutSeconds 与 HibernateAfterIdleSeconds 的特殊之处：0 是**语义有效值**
+	// （"禁用空闲回收"，长任务场景会用到）。因此只在 spec.Lifecycle 整个缺省时才
+	// 用模板值，否则会把一次有意的"禁用"悄悄改回"5 分钟"。
+	if spec == nil {
+		if d.IdleTimeoutSeconds > 0 {
+			lc.IdleTimeoutSeconds = d.IdleTimeoutSeconds
+		}
+	}
+	// HeartbeatGraceSeconds 没有"0 有效"的含义（CRD Minimum=10），
+	// 因此零值只能意味着未设置 —— 它可以单独回退到模板值，
+	// 而不需要像 idleTimeout 那样要求整个 spec.Lifecycle 缺省。
+	// 把这两个字段用同一条规则处理，会让"只想覆盖 TTL"的沙箱
+	// 意外地把模板的心跳宽限期一起丢掉，后果是客户端被过早判为离线。
+	if spec == nil || spec.HeartbeatGraceSeconds == 0 {
+		if d.HeartbeatGraceSeconds > 0 {
+			lc.HeartbeatGraceSeconds = d.HeartbeatGraceSeconds
+		}
+	}
+	if (spec == nil || spec.ReclaimPolicy == "") && d.ReclaimPolicy != "" {
+		if p := sandboxv1alpha1.ReclaimPolicy(d.ReclaimPolicy); p == sandboxv1alpha1.ReclaimReturnToPool ||
+			p == sandboxv1alpha1.ReclaimDestroy {
+			lc.ReclaimPolicy = p
+		}
+	}
+
+	// 这两项没有沙箱级字段，取值即为模板值（模板未设则保持代码默认）。
+	lc.MaxClaimCount = d.MaxClaimCount
+	lc.AllowSameTenantReuse = d.AllowSameTenantReuse
 	return lc
 }

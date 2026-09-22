@@ -29,6 +29,35 @@ const (
 
 	// LabelRequestID 用于把平台对象与业务日志关联（全链路追踪）。
 	LabelRequestID = "sandbox.example.com/request-id"
+
+	// LabelSandbox 是**子对象**（Pod / NetworkPolicy / PVC）指向其所属沙箱的标签。
+	//
+	// 有了它，Finalizer 与 Sweeper 就能用 label selector 精确找出"属于这个沙箱"的
+	// 附属资源，而不必反推命名规则。命名规则（如 "<沙箱>-data"）在代码里
+	// 每改一次就会静默地漏掉一批对象，而 selector 不会。
+	LabelSandbox = "sandbox.example.com/sandbox"
+)
+
+// 注解键名。同样是跨组件契约。
+const (
+	// AnnoBlockedSince 记录一个对象被判定为异常（孤儿/卡死）的起始时间。
+	//
+	// Sweeper 用它实现"先标记、下一轮再删"：单轮直接删会在
+	// "控制器恰好正在创建这个对象"时误删正常资源。关键在于宽限期衡量的是
+	// **从标记开始**过了多久，而不是对象有多老 —— 一个 2 小时前创建的 Pod
+	// 完全可能刚刚才变成孤儿，用年龄做宽限会让它在正常删除流程中被立刻删掉。
+	AnnoBlockedSince = "sandbox.example.com/blocked-since"
+	// AnnoWakeRequested 是手工唤醒请求（gateway 的 :wake），值为 "true"。
+	//
+	// 用注解而不是新增 spec 字段：唤醒是一次**动作**而非持续期望状态，
+	// 写成 spec 字段会变成"一直要求唤醒"，与休眠态的判断直接打架。
+	//
+	// 契约是单向的：gateway 写，控制器只读。解除请求同样由 gateway 完成
+	// （:wake 清掉 hibernate 标记）—— 若让控制器在动作完成后回写注解，
+	// 就变成两个写入者，而两个写入者互相覆盖是这类 bug 的常见来源。
+	AnnoWakeRequested = "sandbox.example.com/wake-requested"
+	// AnnoHibernateRequested 是手工休眠请求（gateway 的 :hibernate），值为 "true"。
+	AnnoHibernateRequested = "sandbox.example.com/hibernate-requested"
 )
 
 // 平台命名空间。库存与已认领沙箱都在 sandbox-pool 里，租户不直接操作
@@ -43,6 +72,12 @@ const (
 const (
 	RoleSandbox     = "sandbox"
 	RolePlaceholder = "placeholder" // 节点容量预铺用的占位 Pod，负优先级、可被抢占
+	// RoleNetpol 标记由平台为沙箱创建的网络策略。
+	// 与 RoleSandbox 分开是必要的：operator 的 Pod 缓存按 role=sandbox 过滤，
+	// 把网络策略也标成同一个值会让"按角色过滤"失去意义。
+	RoleNetpol = "sandbox-netpol"
+	// RoleDataVolume 标记沙箱的数据卷（ephemeral PVC）。
+	RoleDataVolume = "sandbox-volume"
 )
 
 // 资源档位名称。与平台侧 tiers ConfigMap 的键一一对应。

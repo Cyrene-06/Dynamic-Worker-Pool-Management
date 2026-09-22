@@ -23,6 +23,39 @@
       "console": "integratedTerminal"
     },
     {
+      "name": "Gateway",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/gateway",
+      "args": [
+        "--bind-address=:8090",
+        "--sandbox-namespace=sandbox-pool",
+        "--tenant-tokens-file=${workspaceFolder}/config/gateway/tenant-tokens.example"
+      ],
+      "env": {
+        "GOFLAGS": "-mod=mod",
+        // 引用**运行时**环境变量而不是写字面值：写进去就是提交密钥。
+        // 启动前请先设置 SANDBOX_TOKEN_ISSUER_SECRET，例如
+        //   powershell: $env:SANDBOX_TOKEN_ISSUER_SECRET = openssl rand -hex 32
+        "SANDBOX_TOKEN_ISSUER_SECRET": "${env:SANDBOX_TOKEN_ISSUER_SECRET}"
+      },
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Sweeper（干跑一轮）",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/sweeper",
+      "args": [
+        "--dry-run",
+        "--kubeconfig=${env:HOME}/.kube/config"
+      ],
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen"
+    },
+    {
       "name": "Debug 当前测试",
       "type": "go",
       "request": "launch",

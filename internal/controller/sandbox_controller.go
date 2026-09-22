@@ -7,6 +7,7 @@ import (
 
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -55,6 +56,10 @@ type SandboxReconciler struct {
 	Resolver *isolation.Resolver
 	Recorder record.EventRecorder
 
+	// StateFlusher 负责状态外置落盘（L3）。为空时使用 DisabledFlusher，
+	// 它会明确拒绝而不是假装落盘成功。
+	StateFlusher StateFlusher
+
 	// Clock 可注入，便于测试时间相关分支。
 	Clock func() time.Time
 }
@@ -78,24 +83,83 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.ensureFinalizers(ctx, &sbx)
 	}
 
+	// 崩溃恢复：已经决定回收、但对象还没删掉。
+	//
+	// 决策与删除是两次写，中间可能崩溃或被重启。没有这一步，对象会永远停在
+	// Terminating —— 而状态机对 Terminating 不做任何推进，于是它既不回收资源、
+	// 也不再计入池水位，成为一个纯粹靠人工发现的泄漏。
+	if sbx.Status.Phase == sandboxv1alpha1.PhaseTerminating {
+		return ctrl.Result{}, r.deleteSandbox(ctx, &sbx)
+	}
+
+	// 终态对象必须被删除。
+	//
+	// Failed 是终态，而状态机对终态不做任何推进（NextPhase 返回 ReasonTerminal）。
+	// 若不在这里删掉，一个被判失败的沙箱会永远留在集群里：它不回收资源、
+	// 不计入池水位、也不会被下一轮 reconcile 处理 —— 相当于把泄漏
+	// 换成了另一个名字。删除后 Finalizer 链会完成实际清理。
+	//
+	// 同样的原因，Sweeper 的对账动作选择"标记 Failed"而不是自己删：
+	// 标记后由这里接手，就能保住 Finalizer 链的清理顺序（先断网、再落盘、后删卷）。
+	if sbx.Status.Phase.IsTerminal() {
+		return ctrl.Result{}, r.deleteSandbox(ctx, &sbx)
+	}
+
 	o, err := r.observe(ctx, &sbx)
 	if err != nil {
 		// 观察失败时**不做决策**：把"读不到状态"当成"沙箱异常"会导致误回收。
 		return ctrl.Result{}, err
 	}
 
-	d := NextPhase(&sbx, *o)
+	// 认领契约必须在**决策之前**落进 status。
+	// 顺序反了的话，本轮决策读到的 claimedAt 是空的，空闲判定会退化成
+	// "从创建时间算起"，于是一个在池里待了很久的库存会在认领当轮被判空闲并回收。
+	bound := r.bindClaimStatus(&sbx, o.Now)
+
+	// 承载节点必须写回 status：
+	//   - Sweeper 的"节点已不存在"对账靠 status.nodeName 定位；
+	//   - 排障时需要知道沙箱当时跑在哪台机器上，而 Pod 删掉后就查不到了。
+	nodeChanged := false
+	if o.NodeName != "" && sbx.Status.NodeName != o.NodeName {
+		sbx.Status.NodeName = o.NodeName
+		nodeChanged = true
+	}
+
+	// 心跳 Lease 是**收敛目标**而不是一次性动作：每轮都确保它存在，
+	// 这样一次手工误删能被自动修复，而不会演变成一次误回收。
+	if sbx.Spec.Claim != nil {
+		if err := r.ensureLease(ctx, &sbx, o.Now); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// 模板提供生命周期默认值（maxClaimCount、模板级空闲阈值）。
+	//
+	// 必须在决策**之前**拿到：状态机自己只能看到沙箱，若不给它这些取值，
+	// 所有模板级默认值都会被重算成零值 —— 表现是"模板里配了 maxClaimCount
+	// 但库存永远不轮换"，而配置看起来完全正确，没有任何线索。
+	tmpl := r.templateFor(ctx, &sbx)
+	lc := ApplyTemplateDefaults(&sbx, tmpl)
+
+	d := NextPhaseWithLifecycle(&sbx, lc, *o)
 
 	// 先落 status，再动实际资源。顺序反过来的话，一旦中间失败，
 	// 实际资源已经变了但 status 没变，下一轮会做出不一致的决策。
 	if d.Next != "" && d.Next != sbx.Status.Phase {
-		if err := r.applyTransition(ctx, &sbx, d); err != nil {
+		if err := r.applyTransition(ctx, &sbx, d, tmpl); err != nil {
 			return ctrl.Result{}, err
 		}
 		r.Recorder.Eventf(&sbx, corev1.EventTypeNormal, "PhaseTransition",
 			"%s -> %s (%s)", sbx.Status.Phase, d.Next, d.Reason)
 		log.Info("phase transition",
 			"from", sbx.Status.Phase, "to", d.Next, "reason", string(d.Reason))
+	} else if bound.Changed() || nodeChanged {
+		// 没有阶段迁移但事实变了（典型场景：冷路径直接在 Provisioning 上认领，
+		// 不会有 Ready → Running 这次迁移）。不持久化的话 claimedAt 永远写不进去，
+		// 空闲判定会一直是错的 —— 而且从任何日志里都看不出哪里错。
+		if err := r.Status().Update(ctx, &sbx); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: d.RequeueAfter}, nil
@@ -143,10 +207,12 @@ func (r *SandboxReconciler) observe(ctx context.Context, sbx *sandboxv1alpha1.Ag
 	err = r.Get(ctx, types.NamespacedName{Namespace: sbx.Namespace, Name: sbxLeaseName(sbx)}, &lease)
 	switch {
 	case err == nil:
+		o.LastLeaseRenewAt = leaseRenewTime(&lease)
 		o.LeaseHealthy = leaseHealthy(&lease, EffectiveLifecycle(sbx), now)
 	case apierrors.IsNotFound(err):
 		// 尚未认领的库存没有 Lease，这不算"心跳丢失"。
 		o.LeaseHealthy = sbx.Spec.Claim == nil
+		o.LastLeaseRenewAt = time.Time{}
 	default:
 		return nil, fmt.Errorf("读取 Lease 失败: %w", err)
 	}
@@ -155,13 +221,27 @@ func (r *SandboxReconciler) observe(ctx context.Context, sbx *sandboxv1alpha1.Ag
 	// 这里只填已经持久化在 status 里的观测值。实时的 eBPF / cgroup 信号
 	// 由节点侧 agent 采集后回写 status，控制器不直接读宿主指标 ——
 	// 否则控制器就依赖了具体节点，无法水平扩展。
-	o.NetworkActivity = sbx.Status.Activity.ActiveConnections > 0
+	//
+	// 注意取的是 CPUIncrementMilli（区间增量）而不是 P95CPUmilli：
+	// P95 是历史分位数，一个沙箱只要曾经跑过高负载，它的 P95 就会在整个
+	// 统计窗口内居高不下。把 P95 当增量用会让该沙箱**永远显示为活跃、
+	// 永远不被回收**，而且从 status 上看不出任何异常。
 	o.ActiveConnections = sbx.Status.Activity.ActiveConnections
-	o.CPUIncrementMilli = sbx.Status.Activity.P95CPUmilli
+	o.NetworkActivity = o.ActiveConnections > 0
+	o.CPUIncrementMilli = sbx.Status.Activity.CPUIncrementMilli
 
 	// ---- 休眠 ----
 	o.Frozen = sbx.Status.Hibernation.State == sandboxv1alpha1.RuntimeFrozen
 	o.Resumed = sbx.Status.Hibernation.State == sandboxv1alpha1.RuntimeActive
+
+	// ---- 人工干预 ----
+	// 只有"要求唤醒"而没有"要求休眠"时才算人工休眠请求：
+	// 两个标记可能同时存在（客户先后调了 :hibernate 和 :wake），
+	// 而 gateway 未必来得及清理。此时以唤醒为准 —— 让一个本应被唤醒的
+	// 会话保持冻结，比让一个本应冻结的会话多跑一会儿代价大得多：
+	// 前者是业务实际不可用，后者只是资源多占一点。
+	o.ManualWake = sbx.Annotations[sandboxv1alpha1.AnnoWakeRequested] == "true"
+	o.ManualHibernate = sbx.Annotations[sandboxv1alpha1.AnnoHibernateRequested] == "true" && !o.ManualWake
 
 	return o, nil
 }
@@ -171,22 +251,55 @@ func (r *SandboxReconciler) applyTransition(
 	ctx context.Context,
 	sbx *sandboxv1alpha1.AgentSandbox,
 	d Decision,
+	tmpl *sandboxv1alpha1.SandboxTemplate,
 ) error {
-	// 1. 回收类决策：进入 Terminating，后续由 Finalizer 链完成实际清理。
-	if d.Reclaim && d.Next == sandboxv1alpha1.PhaseTerminating {
-		sbx.Status.Metrics.RecycleReason = d.RecycleReason
+	// 1. 回收/失败类决策：记下原因、落 status，然后**删除对象**，
+	//    由 Finalizer 链接手实际清理。
+	//
+	//    为什么必须真删、而不是停在 Terminating：状态机对 Terminating 不做任何推进，
+	//    停在那个阶段的对象既不回收资源、也不再计入池水位 —— 是纯泄漏。
+	//    删除后清理顺序由 Finalizer 链的顺序保证（先断网、后落盘、再删卷）。
+	//
+	//    先写 status 再删除，是为了让业务在对象消失前还能通过 GET 拿到
+	//    recycleReason（对应 API 契约里的 410 Gone）。
+	if d.Reclaim {
+		sbx.Status.Phase = d.Next
+		sbx.Status.ObservedGeneration = sbx.Generation
+		if d.RecycleReason != "" {
+			sbx.Status.Metrics.RecycleReason = d.RecycleReason
+		}
+		meta.SetStatusCondition(&sbx.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeFor(d),
+			Status:             metav1.ConditionTrue,
+			Reason:             string(d.Reason),
+			Message:            d.Message,
+			ObservedGeneration: sbx.Generation,
+		})
+		if err := r.Status().Update(ctx, sbx); err != nil {
+			// 冲突时交给下一轮重试：此时决策仍未生效，重放是安全的。
+			if apierrors.IsConflict(err) {
+				return nil
+			}
+			return err
+		}
+		return r.deleteSandbox(ctx, sbx)
 	}
 
 	// 2. 需要 Pod 的阶段但 Pod 不存在 → 创建。
-	//    Provisioning 的创建动作放在这里，而不是由决策函数做 ——
+	//    创建动作放在这里，而不是由决策函数做 ——
 	//    决策函数必须是纯函数，不能有副作用。
 	if d.Next == sandboxv1alpha1.PhaseProvisioning && sbx.Status.PodName == "" {
-		if err := r.ensurePod(ctx, sbx); err != nil {
+		if err := r.ensurePod(ctx, sbx, tmpl); err != nil {
 			return err
 		}
 	}
 
-	// 3. 写 status。
+	// 3. 首次就绪时间用于冷启动延迟 SLO（P95 ≤ 2.5s）。
+	if d.Next == sandboxv1alpha1.PhaseReady || d.Next == sandboxv1alpha1.PhaseRunning {
+		markProvisioned(sbx, r.now())
+	}
+
+	// 4. 写 status。
 	sbx.Status.Phase = d.Next
 	sbx.Status.ObservedGeneration = sbx.Generation
 	meta.SetStatusCondition(&sbx.Status.Conditions, metav1.Condition{
@@ -197,6 +310,25 @@ func (r *SandboxReconciler) applyTransition(
 		ObservedGeneration: sbx.Generation,
 	})
 	return r.Status().Update(ctx, sbx)
+}
+
+// deleteSandbox 删除 AgentSandbox，交由 Finalizer 链完成实际清理。
+//
+// 幂等是硬要求：崩溃恢复路径会重复调用它。
+func (r *SandboxReconciler) deleteSandbox(ctx context.Context, sbx *sandboxv1alpha1.AgentSandbox) error {
+	// 显式指定 Background 传播：默认传播策略会随对象带不带 finalizer 变化，
+	// 而删除时机在这里必须是确定的（background 不会阻塞本对象的删除）。
+	err := r.Delete(ctx, sbx, client.PropagationPolicy(metav1.DeletePropagationBackground))
+	switch {
+	case err == nil, apierrors.IsNotFound(err):
+		return nil
+	case apierrors.IsConflict(err):
+		// 对象已被别人改动（如 gateway 刚刚写入 claim）。
+		// 交给下一轮：重读后重新决策比强行覆盖安全。
+		return nil
+	default:
+		return fmt.Errorf("删除沙箱失败: %w", err)
+	}
 }
 
 // conditionTypeFor 把决策映射到 Condition 类型。
@@ -268,39 +400,23 @@ func (r *SandboxReconciler) reconcileDelete(ctx context.Context, sbx *sandboxv1a
 
 // runFinalizerStep 执行单个清理步骤。
 //
-// 骨架阶段只实现了 Lease 清理（它最关键：Lease 是业务判断"沙箱是否存活"的依据，
-// 不先释放会让客户端一直以为沙箱还在）。其余步骤在 M1 补齐。
+// 每一步的实现都假设自己可能被**重复调用**（删除流程可断点续行），
+// 因此全部写成"确保状态"而非"执行动作"：删除不存在的对象返回 nil。
 func (r *SandboxReconciler) runFinalizerStep(ctx context.Context, name string, sbx *sandboxv1alpha1.AgentSandbox) error {
 	switch name {
 	case FinalizerLeaseCleanup:
-		var lease coordinationv1.Lease
-		err := r.Get(ctx, types.NamespacedName{Namespace: sbx.Namespace, Name: sbxLeaseName(sbx)}, &lease)
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		return client.IgnoreNotFound(r.Delete(ctx, &lease))
-
+		return r.finalizeLeaseCleanup(ctx, sbx)
 	case FinalizerNetworkCleanup:
-		// TODO(M1): 删除该沙箱的 CiliumNetworkPolicy / NetworkPolicy。
-		return nil
-
+		return r.finalizeNetworkCleanup(ctx, sbx)
 	case FinalizerStateFlush:
-		// TODO(M1): 触发状态外置落盘（L3），带超时。
-		// 注意顺序：必须在断网之后、删卷之前 —— 此时卷仍可读。
-		return nil
-
+		return r.finalizeStateFlush(ctx, sbx)
 	case FinalizerVolumeCleanup:
-		// TODO(M1): 清理残余的 ephemeral PVC 与本地卷。
-		return nil
-
+		return r.finalizeVolumeCleanup(ctx, sbx)
 	case FinalizerMetricsFinalize:
-		// TODO(M1): 上报最终用量与回收原因到外部系统，供成本核算。
-		return nil
-
+		return r.finalizeMetricsFinalize(ctx, sbx)
 	default:
+		// 未知 finalizer 不得让删除流程卡住：它不是本版本注入的，
+		// 本版本也无从知道怎么清理它。持绘不解比持绘错更危险。
 		return nil
 	}
 }
@@ -309,10 +425,17 @@ func (r *SandboxReconciler) runFinalizerStep(ctx context.Context, name string, s
 //
 // 骨架实现：只落最小可运行的 Pod（镜像 + 档位资源 + RuntimeClass + 节点约束）。
 // M0/M1 需要补齐的部分已在下方标注。
-func (r *SandboxReconciler) ensurePod(ctx context.Context, sbx *sandboxv1alpha1.AgentSandbox) error {
-	var tmpl sandboxv1alpha1.SandboxTemplate
-	if err := r.Get(ctx, types.NamespacedName{Name: sbx.Spec.TemplateRef.Name}, &tmpl); err != nil {
-		return fmt.Errorf("读取模板 %q 失败: %w", sbx.Spec.TemplateRef.Name, err)
+func (r *SandboxReconciler) ensurePod(
+	ctx context.Context,
+	sbx *sandboxv1alpha1.AgentSandbox,
+	tmpl *sandboxv1alpha1.SandboxTemplate,
+) error {
+	if tmpl == nil {
+		// 模板缺失是**硬错误**，不是"用默认值继续"。
+		// 模板决定了镜像与出口档位，缺它就没法创建一个正确的沙箱；
+		// 用占位值建出来的 Pod 会是一个既连不上也不受出口管制的东西 ——
+		// 那比不创建危险得多。
+		return fmt.Errorf("模板 %q 不存在", sbx.Spec.TemplateRef.Name)
 	}
 
 	// 解析隔离级别 —— 这是本骨架与"写死 RuntimeClass"的关键差别：
@@ -333,12 +456,25 @@ func (r *SandboxReconciler) ensurePod(ctx context.Context, sbx *sandboxv1alpha1.
 			"请求 %s，实际生效 %s", av.RequestedLevel, av.Level)
 	}
 
+	// 网络策略在 Pod **之前**创建。
+	//
+	// NetworkPolicy 是按 label 选 Pod 的声明式对象，后创建也仍然生效；
+	// 区别只在于"Pod 已经能收包但策略还没下发"这段窗口的长度。
+	// 默认拒绝是要关门，门就应当在房间里有人之前装好。
+	if err := r.ensureNetworkPolicy(ctx, sbx); err != nil {
+		return err
+	}
+
 	labels := map[string]string{
 		sandboxv1alpha1.LabelPool:      sbx.Spec.PoolRef.Name,
 		sandboxv1alpha1.LabelTier:      sbx.Spec.Tier,
 		sandboxv1alpha1.LabelTemplate:  sbx.Spec.TemplateRef.Name,
 		sandboxv1alpha1.LabelIsolation: string(av.Level),
 		sandboxv1alpha1.LabelRole:      sandboxv1alpha1.RoleSandbox,
+		// LabelSandbox 让 Finalizer 与 Sweeper 能用 selector 精确找到
+		// "属于这个沙箱"的附属资源。没有它就只能反推命名规则，
+		// 而命名规则每改一次都会静默地漏掉一批对象。
+		sandboxv1alpha1.LabelSandbox: sbx.Name,
 	}
 	claimed := "false"
 	if sbx.Spec.Claim != nil {
@@ -401,6 +537,24 @@ func (r *SandboxReconciler) ensurePod(ctx context.Context, sbx *sandboxv1alpha1.
 	return nil
 }
 
+// templateFor 读取沙箱引用的模板。
+//
+// 取不到时返回 nil 而不是错误：模板可能正在被（重新）创建，
+// 而沙箱此时仍应能被正确回收 —— 用"模板读不到"当作"不能决策"，
+// 会让一个模板问题升级成所有引用它的沙箱都无法回收。
+func (r *SandboxReconciler) templateFor(
+	ctx context.Context,
+	sbx *sandboxv1alpha1.AgentSandbox,
+) *sandboxv1alpha1.SandboxTemplate {
+	var tmpl sandboxv1alpha1.SandboxTemplate
+	if err := r.Get(ctx, types.NamespacedName{Name: sbx.Spec.TemplateRef.Name}, &tmpl); err != nil {
+		logf.FromContext(ctx).V(1).Info("读取模板失败，本次决策将只使用代码默认值",
+			"template", sbx.Spec.TemplateRef.Name, "err", err.Error())
+		return nil
+	}
+	return &tmpl
+}
+
 // SetupWithManager 注册控制器。
 //
 // concurrency 可以设得较大（默认 32）：单沙箱的决策彼此独立，
@@ -417,8 +571,12 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrency int) 
 		// Owns 让 Pod 的创建/删除/就绪变化直接驱动 reconcile。
 		// 这是把“等待 Pod 就绪”从 2s 轮询变成事件驱动的关键：
 		// 冷路径 P95 目标 2.5s，如果靠轮询，光发现就绪就要多花 2s。
-		Owns(&corev1.Pod{}).
-		WithOptions(rtctrl.Options{MaxConcurrentReconciles: concurrency}).
+		Owns(&corev1.Pod{}). // Lease 的变化同样直接驱动：心跳丢失需要**尽快**被发现。
+		// 若只靠 RequeueAfter，识别延迟至少叠加一个轮询周期（30s），
+		// 而这个延迟会原封不动地加到"客户端已经死了"到"资源被回收"之间。
+		Owns(&coordinationv1.Lease{}).
+		// 网络策略被手工删除时要能重新收敛，否则会静默地失去隔离边界。
+		Owns(&networkingv1.NetworkPolicy{}).WithOptions(rtctrl.Options{MaxConcurrentReconciles: concurrency}).
 		Complete(r)
 }
 

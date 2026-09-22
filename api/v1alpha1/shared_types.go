@@ -184,8 +184,14 @@ type ClaimSpec struct {
 
 // ClaimStatus 是认领结果的不可变快照。tenant 一旦写入不可变更（INV-4）。
 type ClaimStatus struct {
-	Tenant    string       `json:"tenant,omitempty"`
-	SessionID string       `json:"sessionId,omitempty"`
+	Tenant    string `json:"tenant,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+	// RequestID 是本次认领的幂等键。
+	//
+	// 它存在的理由很具体：控制器靠它判定"这次 spec.claim 是否已经写入过 status"。
+	// 少了它就只能用"claimRef 是否为空"来判断，而 release 后的重认领（同租户复用）
+	// 会被当成同一次认领 —— claimedCount 漏计，maxClaimCount 形同虚设。
+	RequestID string       `json:"requestId,omitempty"`
 	ClaimedAt *metav1.Time `json:"claimedAt,omitempty"`
 	// LeaseName 指向心跳 Lease 对象；命名约定为与沙箱同名（便于按名查找，避免全量 list）。
 	LeaseName string `json:"leaseName,omitempty"`
@@ -295,10 +301,22 @@ type NetworkSpec struct {
 
 // ActivityStatus 记录活动观测，是空闲判定的辅助信号。
 type ActivityStatus struct {
-	LastActiveAt      *metav1.Time `json:"lastActiveAt,omitempty"`
-	ActiveConnections int32        `json:"activeConnections,omitempty"`
-	P95CPUmilli       int64        `json:"p95CpuMilli,omitempty"`
-	P95MemMiB         int64        `json:"p95MemMiB,omitempty"`
+	// LastActiveAt 是最近一次确认有活动的时间，是空闲判定的基准之一。
+	LastActiveAt *metav1.Time `json:"lastActiveAt,omitempty"`
+	// ActiveConnections 是当前活跃连接数。
+	ActiveConnections int32 `json:"activeConnections,omitempty"`
+	// CPUIncrementMilli 是**上一个采样区间内**的 CPU 用量增量（毫核·秒）。
+	//
+	// 它与下面的 P95CPUmilli 是两个不同的量，因此必须是两个字段：
+	// "刚刚用了多少 CPU" 适合判定"现在是否有人在干活"，
+	// 而 P95 分位数是历史统计量，一旦某个沙箱曾经跑过高负载，
+	// 它的 P95 会在整个统计窗口内居高不下 —— 用它做空闲判定会让沙箱
+	// **永远显示为活跃、永远不被回收**，且日志上看不出任何异常。
+	CPUIncrementMilli int64 `json:"cpuIncrementMilli,omitempty"`
+	// P95CPUmilli / P95MemMiB 是画像用的历史分位数，由 ResourceOptimizer 消费，
+	// **不参与**空闲判定。
+	P95CPUmilli int64 `json:"p95CpuMilli,omitempty"`
+	P95MemMiB   int64 `json:"p95MemMiB,omitempty"`
 }
 
 // HibernationStatus 是休眠子状态。

@@ -131,6 +131,14 @@ func main() {
 		Scheme:   mgr.GetScheme(),
 		Resolver: resolver,
 		Recorder: mgr.GetEventRecorderFor("sandbox-controller"),
+		// 状态落盘（L3）目前显式使用 DisabledFlusher：
+		// 它对启用了 state.externalize 的沙箱会**返回错误**，而不是假装成功。
+		//
+		// 这个选择是有代价的（那些沙箱的 finalizer 步骤会失败并留下 Warning 事件），
+		// 但两条路都写在明处：假成功会让业务在 410 Gone 之后永远拿不回状态，
+		// 而那是一种在最不容易被看到的位置（删除流程里）发生的数据丢失。
+		// 真正的落盘实现随 M2 的对象存储接入一起提供。
+		StateFlusher: controller.DisabledFlusher{},
 	}).SetupWithManager(mgr, sandboxConcurrency); err != nil {
 		logger.Error(err, "注册 SandboxController 失败")
 		os.Exit(1)

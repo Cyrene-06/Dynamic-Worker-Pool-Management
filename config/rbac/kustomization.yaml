@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 三个组件的 RBAC 一起发布。
+#
+# 它们放在同一个目录是对的：权限是**一个整体**，单独升级其中一份
+# 会出现"新组件跑起来了但没有权限"或者"旧权限还没收回"的中间状态。
+# 一次性 apply 让权限集合要么全是旧的、要么全是新的。
+resources:
+  - rbac.yaml
+  - gateway-sweeper.yaml

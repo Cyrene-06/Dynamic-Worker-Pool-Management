@@ -1,0 +1,132 @@
+# 业务接入层（sandbox-gateway）。
+#
+# ⚠️ 镜像尚未构建：本仓库还没有 Dockerfile，因为当前开发机没有可用的容器
+# 运行时（Docker Desktop 未初始化、WSL2 未启用）。这份清单已用
+# `kubectl kustomize` 渲染验证，但**没有**在真实集群上部署验证过。
+# 这一点必须说清楚，否则"有清单"很容易被读成"已经跑通"。
+#
+# ⚠️ 上线前必须手工创建 Secret `sandbox-gateway-auth`（两个键：
+# tenant-tokens、issuer-secret）。它**不在**仓库里，示例见同目录的
+# `tenant-tokens.example`。Secret 缺失时 Pod 会因缺少令牌表而拒绝启动 ——
+# 这是刻意的：一个没有鉴权的接入层比不可用严重得多。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sandbox-gateway
+  namespace: sandbox-system
+  labels:
+    app: sandbox-gateway
+    sandbox.example.com/role: gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sandbox-gateway
+  template:
+    metadata:
+      labels:
+        app: sandbox-gateway
+        sandbox.example.com/role: gateway
+    spec:
+      serviceAccountName: sandbox-gateway
+      # 接入层是无状态的。快速退出即可：在途请求由业务按 Retry-After 重试，
+      # 而长时间等待只会拖长滚动升级窗口。
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          # 上线时必须替换为真实镜像（含不可变 tag/digest）。
+          image: ghcr.io/cyrene-06/dwp-gateway:dev
+          args:
+            - --bind-address=:8090
+            - --health-probe-bind-address=:8091
+            - --sandbox-namespace=sandbox-pool
+            - --tenant-tokens-file=/etc/sandbox/auth/tenant-tokens
+            # --token-issuer-secret 刻意**不**写在参数里：
+            # 命令行参数会出现在 ps 输出与 kubectl describe 里，
+            # 而那些输出经常被贴进工单与聊天记录。它由下面的环境变量提供。
+          env:
+            - name: SANDBOX_TOKEN_ISSUER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sandbox-gateway-auth
+                  key: issuer-secret
+          ports:
+            - name: http
+              containerPort: 8090
+            - name: probe
+              containerPort: 8091
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: probe
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probe
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            # 延迟敏感、内存占用小。内存上限与缓存规模（即沙箱数量）同阶，
+            # 因此调池规模时必须一起评估这里。
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: auth
+              mountPath: /etc/sandbox/auth
+              readOnly: true
+      volumes:
+        - name: auth
+          secret:
+            secretName: sandbox-gateway-auth
+            items:
+              - key: tenant-tokens
+                path: tenant-tokens
+      # 说明：这里不挂 --quota-file。租户配额是可选的，不配置时
+      # 使用默认上限（见 gateway.DefaultQuotaTable）。需要按租户限额时
+      # 再加一个 ConfigMap 挂载并补上该参数 —— 默认挂一个不存在的
+      # ConfigMap 会让 Pod 直接起不来，而"因为一个可选功能没配就完全不可用"
+      # 是不划算的。
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sandbox-gateway
+  namespace: sandbox-system
+  labels:
+    app: sandbox-gateway
+spec:
+  selector:
+    app: sandbox-gateway
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http
+---
+# 滚动升级/节点维护时至少保留 1 个副本。
+# 接入层是业务申请沙箱的唯一入口，全部副本同时不可用意味着整个平台的
+# **新申请**完全失败（已有沙箱不受影响）—— 这个区别决定了它的 SLO 含义。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sandbox-gateway
+  namespace: sandbox-system
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sandbox-gateway

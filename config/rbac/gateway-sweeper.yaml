@@ -1,0 +1,133 @@
+# 接入层（gateway）与对账（sweeper）的 RBAC。
+#
+# 与 config/rbac/rbac.yaml 分开，是为了让"控制面的最小权限基线"
+# 保持可读 —— 那份清单本身是 docs/08 §8.2 的可执行安全基线，
+# 混进两个新组件会让它变得难以对照评审。
+#
+# =============================================================================
+# 一个值得单独说明的设计：gateway **没有** agentsandboxes/status 的写权限。
+#
+# "gateway 只写 spec、控制器只写 status" 这条约定写在 internal/claim 的
+# 包注释里，但注释拦不住任何一次疏忽。把它落到 RBAC 上之后，
+# 违反它就变成一次 403 —— 也就是说，这条约定从"代码审查时要记得的事"
+# 变成了"集群会拒绝的事"。
+#
+# 两个写入者同时改同一个 status 会互相覆盖，而症状是"状态偶尔跳变"，
+# 属于极难定位的一类问题。让它在第一次尝试时就被拒绝，成本最低。
+# =============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-gateway
+  namespace: sandbox-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-gateway
+rules:
+  # 认领（CAS）、释放（清空 claim）、冷路径创建。
+  # patch 是这里最关键的一项：它承载 CAS 的乐观锁。
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["agentsandboxes"]
+    verbs: ["get", "list", "watch", "create", "patch"]
+  # 刻意**没有** agentsandboxes/status —— 见文件头说明。
+
+  # 心跳 Lease：gateway 负责"续租"（唯一由客户端驱动的入站信号）。
+  # 不授予 create：Lease 的**创建**由控制器完成，这样 CAS 成功与
+  # 心跳开始之间存在空洞时不会误判为"客户端已死"。
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "update"]
+
+  # 池水位查询与排空（管理员接口）。
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["sandboxpools"]
+    verbs: ["get", "list", "watch", "patch"]
+  # 模板默认值（TTL、maxClaimCount）需要读。
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["sandboxtemplates"]
+    verbs: ["get", "list", "watch"]
+
+  # 组装 endpoint 需要读 Pod 的 IP。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-gateway
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbox-gateway
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-gateway
+    namespace: sandbox-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sandbox-sweeper
+  namespace: sandbox-system
+---
+# =============================================================================
+# sweeper 的权限比 gateway 大得多，因为它要能删东西。这是它存在的代价，
+# 因此必须把它的权限写清楚、并且只授予它真正需要的那几类对象。
+#
+# 有两点刻意缩窄：
+#   1. 它只能删 **带本平台角色标签** 的对象 —— 这不是 RBAC 能表达的约束，
+#      而是代码里的正向证据要求（见 internal/sweeper/classify.go 的 classifyScope）。
+#      RBAC 只能保证"它能删的只有这些 kind"，"它不会乱删"靠的是那层筛选。
+#   2. 它**不**授予 agentsandboxes 的 delete。对账发现异常的沙箱时只标记
+#      Failed，删除交给控制器 —— 这样 Finalizer 链的清理顺序（先断网、
+#      再落盘、后删卷）仍然会被执行。让对账绕过 Finalizer 去删，
+#      等于把清理顺序这个安全设计整个丢掉。
+# =============================================================================
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sandbox-sweeper
+rules:
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["agentsandboxes", "sandboxpools", "sandboxtemplates"]
+    verbs: ["get", "list", "watch"]
+  # 唯一需要的写操作：把沙箱标记为 Failed。
+  - apiGroups: ["sandbox.example.com"]
+    resources: ["agentsandboxes/status"]
+    verbs: ["get", "patch"]
+
+  # 孤儿资源清理（都带本平台的 role 标签，见上）。
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims"]
+    verbs: ["get", "list", "delete", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "delete", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "delete", "patch"]
+
+  # 判定"承载节点已不存在"必须能读节点。只读，绝不动节点。
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sandbox-sweeper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sandbox-sweeper
+subjects:
+  - kind: ServiceAccount
+    name: sandbox-sweeper
+    namespace: sandbox-system
