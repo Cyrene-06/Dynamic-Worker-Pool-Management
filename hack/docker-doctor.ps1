@@ -87,8 +87,10 @@ function Invoke-Native {
             # ForEach-Object { "$_" } matters: piping native stderr into Out-String
             # would render ErrorRecords with the whole "CategoryInfo /
             # NativeCommandError / FullyQualifiedErrorId" block, burying the one
-            # line that actually explains the failure.
-            $out = (& $e @a 2>&1 | ForEach-Object { "$_" }) -join "`n"
+            # line that actually explains the failure. The RemoteException filter
+            # drops the bare type name PowerShell tacks onto wrapped stderr records.
+            $out = (& $e @a 2>&1 | ForEach-Object { "$_" } |
+                Where-Object { $_ -notmatch '^System\.Management\.Automation\.\w+$' }) -join "`n"
             @{ Exit = $LASTEXITCODE; Text = $out.Trim() }
         } catch {
             @{ Exit = -1; Text = $_.Exception.Message }
@@ -219,6 +221,23 @@ $wsl = Get-Command wsl -ErrorAction SilentlyContinue
 if (-not $wsl) {
     Write-Bad 'wsl.exe not found: WSL is not installed (the WSL2 backend cannot work).'
 } else {
+    Write-Info "wsl.exe: $($wsl.Source) (file version $((Get-Item $wsl.Source).VersionInfo.FileVersion))"
+
+    # wsl.exe EXISTS ON EVERY modern Windows build, even when WSL is not installed
+    # at all -- it is the inbox stub that can install WSL. So "wsl.exe is present"
+    # must never be read as "WSL works". What proves the runtime is installed:
+    #   - the Store package (MicrosoftCorporationII.WindowsSubsystemForLinux), or
+    #   - %ProgramFiles%\WSL\wsl.exe (the newer MSIX layout)
+    $wslMsix = Get-AppxPackage -Name '*WindowsSubsystemForLinux*' -ErrorAction SilentlyContinue
+    $wslMsixExe = Join-Path $env:ProgramFiles 'WSL\wsl.exe'
+    if ($wslMsix -or (Test-Path $wslMsixExe)) {
+        if ($wslMsix) { Write-OK "WSL runtime package installed: $($wslMsix.Name) $($wslMsix.Version)" }
+        if (Test-Path $wslMsixExe) { Write-OK "WSL runtime found: $wslMsixExe" }
+    } else {
+        Write-Warn 'WSL runtime (the kernel/MSIX) is NOT installed -- only the inbox stub exists.'
+        $script:wslRuntimeMissing = $true
+    }
+
     $st = Invoke-Native wsl @('--status') 20 'unicode'
     if ($st.Exit -eq 0) {
         Write-OK 'wsl --status succeeded.'
@@ -236,23 +255,69 @@ if (-not $wsl) {
         if ($Full) { $lv.Text -split "`n" | ForEach-Object { Write-Info $_.Trim() } }
     } else {
         Write-Warn 'no usable WSL distribution (wsl --list --verbose failed).'
-        Write-Info 'Docker Desktop needs its own distro (docker-desktop);'
-        Write-Info 'run: wsl --install --no-distribution   (as administrator), then reboot.'
+        Write-Info 'Docker Desktop needs its own distro (docker-desktop), created on its first start.'
     }
 }
 
 # ---------------------------------------------------------------------------
-Write-Head '6. Virtualization'
-# Get-WindowsOptionalFeature needs elevation; report it as "unknown" rather than
-# guessing, because a wrong "OK" here would send the reader down the wrong path.
-try {
-    $feat = Get-WindowsOptionalFeature -Online -FeatureName 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform' -ErrorAction Stop
-    foreach ($f in $feat) { Write-Info "$($f.FeatureName) : $($f.State)" }
-} catch {
-    Write-Warn 'cannot read optional features (needs an elevated session).'
-    Write-Info 'In an ADMIN PowerShell run:'
-    Write-Info '  DISM /online /get-featureinfo /featurename:Microsoft-Windows-Subsystem-Linux'
-    Write-Info '  DISM /online /get-featureinfo /featurename:VirtualMachinePlatform'
+Write-Head '6. CPU virtualization and Windows features'
+# Everything here is readable WITHOUT elevation (Win32_Processor, Win32_ComputerSystem,
+# Win32_OptionalFeature, and the registry reboot flags). An earlier version of this
+# script gave up at this point and told the reader to go get admin rights for DISM --
+# which is backwards: on this project's dev machine both features were already ENABLED,
+# and the only real blocker was a pending reboot. Diagnose first, elevate last.
+$cpu = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($cpu) {
+    Write-Info "CPU: $($cpu.Name)"
+    if ($cpu.VirtualizationFirmwareEnabled) {
+        Write-OK 'virtualization is enabled in firmware (VT-x/AMD-V).'
+    } else {
+        Write-Bad 'virtualization is DISABLED in firmware: enable VT-x/AMD-V in BIOS/UEFI.'
+        Write-Info 'No amount of Windows configuration can work around this.'
+    }
+    if ($cpu.SecondLevelAddressTranslationExtensions) {
+        Write-OK 'SLAT (EPT/NPT) is available (WSL2 requires it).'
+    } else {
+        Write-Warn 'SLAT not reported; WSL2 needs it.'
+    }
+}
+$os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+if ($os) { Write-Info "OS: $($os.Caption) build $($os.BuildNumber)" }
+
+foreach ($name in 'Microsoft-Windows-Subsystem-Linux', 'VirtualMachinePlatform') {
+    # InstallState: 1 = absent, 2 = installed/enabled, 3 = disabled.
+    $f = Get-CimInstance Win32_OptionalFeature -Filter "Name='$name'" -ErrorAction SilentlyContinue
+    switch ([int]$f.InstallState) {
+        2 {
+            Write-OK "$name : enabled (InstallState=2)"
+            $script:featuresEnabled = $true
+        }
+        3 { Write-Bad "$name : DISABLED (InstallState=3) -- enable it in an ADMIN shell." }
+        1 { Write-Bad "$name : not installed (InstallState=1) -- enable it in an ADMIN shell." }
+        default { Write-Warn "$name : state unknown (verify with elevated DISM /online /get-featureinfo)." }
+    }
+}
+
+# The trap this section exists for: a feature that is "enabled" in the servicing store
+# is NOT ACTIVE until the machine reboots. Enabled + vmcompute missing + a pending
+# reboot == the single missing step is a reboot, not another command.
+$pending = @()
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pending += 'CBS RebootPending' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pending += 'WindowsUpdate RebootRequired' }
+$pfr = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue).PendingFileRenameOperations
+if ($pfr) { $pending += "PendingFileRenameOperations=$($pfr.Count)" }
+if ($pending.Count -gt 0) {
+    Write-Warn "a reboot is PENDING ($($pending -join ', ')): enable feature changes do not take effect until then."
+    $script:rebootPending = $true
+} else {
+    Write-OK 'no pending reboot detected.'
+}
+
+if ((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).HypervisorPresent) {
+    Write-OK 'the Windows hypervisor is running.'
+} else {
+    Write-Warn 'the Windows hypervisor is NOT running (expected when the platform feature is enabled but not yet active).'
+    $script:hypervisorDown = $true
 }
 
 # ---------------------------------------------------------------------------
@@ -279,25 +344,58 @@ if ($daemonReachable) {
 
 Write-Host 'Daemon NOT reachable. Scripts and unit tests are unaffected (they do not' -ForegroundColor Yellow
 Write-Host 'need a container runtime), but image builds and kind end-to-end runs are' -ForegroundColor Yellow
-Write-Host 'blocked until this is fixed. Fix sequence (ALL steps need ADMIN plus a' -ForegroundColor Yellow
-Write-Host 'reboot, so it cannot be automated from here):' -ForegroundColor Yellow
+Write-Host 'blocked until this is fixed.' -ForegroundColor Yellow
 Write-Host ''
-Write-Host '  1. Enable the WSL2 prerequisites (admin PowerShell):'
-Write-Host '       wsl --install --no-distribution'
-Write-Host '     If wsl.exe is missing entirely, enable the features first:'
-Write-Host '       DISM /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart'
-Write-Host '       DISM /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart'
+Write-Host 'Fix sequence, ordered by what THIS machine is missing (every step needs' -ForegroundColor Yellow
+Write-Host 'administrator rights and/or a reboot, so none of it can be automated here):' -ForegroundColor Yellow
 Write-Host ''
-Write-Host '  2. REBOOT. Skipping this leaves vmcompute unregistered and the same 500 comes back.'
+
+$step = 1
+
+if ($script:rebootPending) {
+    Write-Host "  $step. REBOOT FIRST." -ForegroundColor Cyan
+    Write-Host '     The WSL/VirtualMachinePlatform feature flags are already enabled, but a'
+    Write-Host '     reboot is pending -- enabled-but-not-active is exactly the state where'
+    Write-Host '     wsl.exe and Docker Desktop both report "not installed".'
+    Write-Host '     If the features were NOT enabled, enable them first (admin), then reboot:'
+    Write-Host '       DISM /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart'
+    Write-Host '       DISM /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart'
+    Write-Host ''
+    $step++
+}
+
+if ($script:wslRuntimeMissing) {
+    Write-Host "  $step. Install the WSL2 runtime (ADMIN PowerShell)." -ForegroundColor Cyan
+    Write-Host '       wsl --install --no-distribution'
+    Write-Host '     --no-distribution is deliberate: Docker Desktop brings its own distro'
+    Write-Host '     (docker-desktop); a spare Ubuntu would only eat disk and RAM.'
+    Write-Host '     Restricted network / Store disabled? Then install the MSI offline:'
+    Write-Host '       https://github.com/microsoft/WSL/releases   (wsl.<version>.x64.msi)'
+    Write-Host '     and fall back to: wsl --update'
+    Write-Host ''
+    $step++
+} else {
+    Write-Host "  $step. Refresh/verify the WSL runtime (ADMIN PowerShell)." -ForegroundColor Cyan
+    Write-Host '       wsl --update'
+    Write-Host '       wsl --set-default-version 2'
+    Write-Host ''
+    $step++
+}
+
+Write-Host "  $step. Start Docker Desktop once, as administrator, and wait until it" -ForegroundColor Cyan
+Write-Host '     reports "Docker Desktop is running". The first start creates the'
+Write-Host '     docker-desktop distro and registers com.docker.service.'
 Write-Host ''
-Write-Host '  3. Start Docker Desktop once, as administrator, and wait until it reports'
-Write-Host '     "Docker Desktop is running" (first start initializes the docker-desktop distro).'
+$step++
+
+Write-Host "  $step. Verify (this order tells you WHICH layer is still broken):" -ForegroundColor Cyan
+Write-Host '       wsl --status'
+Write-Host '       wsl --list --verbose'
+Write-Host '       docker info          # must not hang; re-run this script if it does'
 Write-Host ''
-Write-Host '  4. Verify, then re-run this script:'
-Write-Host '       wsl --set-default-version 2'
-Write-Host '       docker info'
-Write-Host ''
-Write-Host '  Note: on Windows Home the WSL2 backend is the only option (no Hyper-V).'
-Write-Host '        Docker Desktop reports a missing virtualization feature explicitly.'
+Write-Host '  Notes:'
+Write-Host '    - On Windows Home there is no Hyper-V: the WSL2 backend is the only option.'
+Write-Host '    - "wsl.exe exists" never means "WSL is installed" -- every modern Windows'
+Write-Host '      ships it as an installer stub.'
 Write-Host ''
 exit 1
