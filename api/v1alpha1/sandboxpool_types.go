@@ -154,6 +154,69 @@ type PoolDrain struct {
 	GraceSeconds int32 `json:"graceSeconds,omitempty"`
 }
 
+// ProtectModeSpec 是雪崩保护（docs/05 §5）的配置。
+//
+// 为什么它不是一个可选优化：容量危机下系统会**自我放大** ——
+// 扩容/重试请求压垮 API Server，更多超时，更多重试，直到彻底不可用。
+// 保护模式是打断这个正反馈的唯一机制，而它必须在阈值上保守、
+// 在退路上明确，否则只会在真正的危机里把问题搞得更糟。
+type ProtectModeSpec struct {
+	// Enabled 关闭后完全不做保护模式判定（留一个显式的开关，
+	// 而不是让运维去把阈值改成不可能达到的值）。
+	//
+	// 用 *bool 而不是 bool：这个字段的默认值是 true，而 bool 的零值
+	// 与显式 false 无法区分 —— 任何不经过 API Server 默认化的写入
+	// （单测构造对象、部分 SSA 场景、直接改对象）都会静默关掉雪崩保护。
+	// "安全机制被静默关闭"是最不该发生的一类问题，因此多一个指针是值得的。
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// FailureRatePercent 是 provision 失败率阈值（百分比）。
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	// +kubebuilder:default=30
+	FailureRatePercent int32 `json:"failureRatePercent,omitempty"`
+
+	// MinSamples 是判定失败率所需的最小样本数。
+	//
+	// 没有它的保护模式会在“1 次尝试、1 次失败”上立刻触发，而保护模式
+	// 本身是有代价的（拒绝低优申请）—— 一个刚扩容、库存尚在创建中的池
+	// 恰好就是这种形态，于是正常扩容会被自己的保护机制打断。
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=10
+	MinSamples int32 `json:"minSamples,omitempty"`
+
+	// ApiserverLatencyThresholdMs 是 API Server P99 阈值（毫秒）。
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:default=2000
+	ApiserverLatencyThresholdMs int32 `json:"apiserverLatencyThresholdMs,omitempty"`
+
+	// HoldSeconds 是进入保护后的最短持续时间（滞回，防抖动）。
+	//
+	// 没有滞回的保护模式会变成振荡器：危机时进、一缓解就出，
+	// 每次进出都伴随一批请求被拒绝/放行。而它的目的是争取恢复时间，
+	// 不是逐秒反映健康度。
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:default=120
+	HoldSeconds int32 `json:"holdSeconds,omitempty"`
+
+	// ScaleUpThrottlePermille 是保护期内扩容限速的比例（500 = 降至 50%）。
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:validation:Maximum=1000
+	// +kubebuilder:default=500
+	ScaleUpThrottlePermille int32 `json:"scaleUpThrottlePermille,omitempty"`
+
+	// MaxQueueDepth 是保护期内高优申请的排队上限（docs/05 §5 的 200）。
+	//
+	// 当前接入层是**快速失败**而非排队（docs/10 Q8 尚未结案），
+	// 因此这个值暂时只作为对外承诺的上限记录在 API 里：
+	// 将来若实现排队，它必须被真正执行；若继续快速失败，它应被删除。
+	// 保留一个不会被读取的字段是有代价的 —— 它会被误认为已经生效。
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=200
+	MaxQueueDepth int32 `json:"maxQueueDepth,omitempty"`
+}
+
 // SandboxPoolSpec 是池策略。
 //
 // 池按「隔离级别 + 规格档位」划分，而不是按租户划分：池的物理意义是资源规格，
@@ -181,6 +244,9 @@ type SandboxPoolSpec struct {
 	PriorityBands []PriorityBand `json:"priorityBands,omitempty"`
 
 	Drain PoolDrain `json:"drain,omitempty"`
+
+	// ProtectMode 是雪崩保护配置（docs/05 §5）。
+	ProtectMode ProtectModeSpec `json:"protectMode,omitempty"`
 }
 
 // SandboxPoolStatus 是池水位与决策的观测状态。
@@ -210,6 +276,31 @@ type SandboxPoolStatus struct {
 
 	// LastScaleDecision 记录最近一次扩缩决策，用于排查振荡。
 	LastScaleDecision *ScaleDecision `json:"lastScaleDecision,omitempty"`
+
+	// ProtectMode 是保护模式的当前状态（docs/05 §5）。
+	//
+	// 放在池的 status 里而不是让各组件各自算：控制面与接入层必须看到
+	// **同一个事实**。否则会出现“控制器认为已恢复、gateway 仍在拒绝”这类
+	// 从任一组件都解释不了的现象，而排查它要花掉危机里最宝贵的时间。
+	ProtectMode ProtectModeStatus `json:"protectMode,omitempty"`
+}
+
+// ProtectModeStatus 是保护模式的当前状态。
+type ProtectModeStatus struct {
+	// Active 表示保护模式正在生效。
+	Active bool `json:"active,omitempty"`
+	// Reason 是进入保护的原因码（枚举，避免成为高基数 label）。
+	Reason string `json:"reason,omitempty"`
+	// Since 是本次（或最近一次）进入保护的时刻。
+	Since *metav1.Time `json:"since,omitempty"`
+	// Until 是滞回期结束时刻；在此之前即使触发条件消失也保持保护。
+	Until *metav1.Time `json:"until,omitempty"`
+	// Trips 是累计进入次数。它比 active 更有信息量：短时间内持续增长
+	// 说明阈值偏低或故障未真正恢复，而 active=true 这两个原因长得一样。
+	Trips int64 `json:"trips,omitempty"`
+	// FailureRatePermille 是本次判定用的失败率（千分比），便于事后复盘
+	// “当时到底多糟”。
+	FailureRatePermille int32 `json:"failureRatePermille,omitempty"`
 }
 
 // ScaleDecision 是一次扩缩决策的快照。

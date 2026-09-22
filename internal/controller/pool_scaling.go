@@ -31,7 +31,13 @@ const (
 	ScaleReasonNodeCapacity   = "InsufficientNodeCapacity"
 	ScaleReasonMetricsMissing = "MetricsUnavailableNeutralFeedback"
 	ScaleReasonMaxWarmReached = "MaxWarmReached"
-	ScaleReasonMinWarmReached = "MinWarmReached" // ScaleReasonProvisioningPending 表示"本轮不需要动作，因为已有库存在创建中"。
+	ScaleReasonMinWarmReached = "MinWarmReached"
+	// ScaleReasonProtectMode 表示扩容幅度被雪崩保护压低（docs/05 §5）。
+	//
+	// 它必须在**限速真的生效时**才被置上：只因为“处于保护中”就置码，
+	// 会让这个原因码无法回答“保护模式到底起没起作用”—— 而那是排查
+	// 容量危机时最需要回答的问题之一。
+	ScaleReasonProtectMode = "ProtectModeThrottled" // ScaleReasonProvisioningPending 表示"本轮不需要动作，因为已有库存在创建中"。
 	//
 	// 单独给出这个原因码是有意的：它让运维能在生产里**直接验证**
 	// "防重复扩容"确实在生效（该计数应占 delta==0 的相当比例），
@@ -102,6 +108,13 @@ type ScaleObservation struct {
 	// （docs/05 §6.1 的时间常数不匹配）。若不限制，控制器会持续创建
 	// 调度不上的 Pending 库存，把"节点不够"伪装成"控制器行为异常"。
 	NodeHeadroom int32
+
+	// ProtectActive 表示该池当前处于雪崩保护中（docs/05 §5）。
+	//
+	// 取值来自池的 status（由 EvaluateProtectMode 判定后写入），
+	// 而不是在这里重新算一遍 —— 同一个事实只能有一个来源，
+	// 否则接入层看到的与控制器用的会是两个可能不一致的判断。
+	ProtectActive bool
 }
 
 // ScaleDecision 是水位决策的结果。
@@ -253,13 +266,23 @@ func DecideScaling(pool *sandboxv1alpha1.SandboxPool, o ScaleObservation) ScaleD
 		d.Reason = ScaleReasonNodeCapacity
 	}
 
-	// ---- 10. 限速 ----
+	// ---- 10. 限速（保护模式下扩容限速额外压低）----
+	//
+	// 只压**扩容**方向：保护模式要打断的正反馈是"扩容/重试压垮 API Server"，
+	// 而缩容不产生这类压力 —— 反过来，保护期恰恰是应当允许回收资源的时候。
 	preClamp := delta
-	delta = clamp32(delta, -int32(effectiveMaxReclaim(sc)), int32(effectiveMaxProvision(sc)))
+	limitUp := int32(effectiveMaxProvision(sc))
+	if o.ProtectActive {
+		limitUp = throttleScaleUp(limitUp, EffectiveProtectThrottlePermille(pool.Spec.ProtectMode))
+	}
+	delta = clamp32(delta, -int32(effectiveMaxReclaim(sc)), limitUp)
 	if clampedByMaxWarm && delta > 0 && delta == preClamp {
 		// 只有在限速**没有**生效时才把原因归于 maxWarm。
 		// 否则会把"被限速"误报成"已达上限"，把运维引向错误的参数。
 		d.Reason = ScaleReasonMaxWarmReached
+	} else if o.ProtectActive && delta > 0 && delta < preClamp {
+		// 仅当限速确实把扩容幅度压小了才改原因码（见 ScaleReasonProtectMode 注释）。
+		d.Reason = ScaleReasonProtectMode
 	}
 
 	// ---- 11. 保底水位 ----
@@ -395,6 +418,26 @@ func effectiveMaxReclaim(sc sandboxv1alpha1.SandboxPoolScaling) int32 {
 		return sc.MaxReclaimPerSecond
 	}
 	return defaultMaxReclaim
+}
+
+// throttleScaleUp 把扩容限速比例乘上限值。
+//
+// 结果至少为 1：限速的目的是**变慢**，不是**停住**。
+// 取整后落到 0 会把保护模式变成另一个功能（停止扩容），
+// 而那个功能已经有专门的开关（degradation.onRuntimeUnavailable=PauseScaling，
+// 以及 spec.scaling.pauseScaling），两者不应该被一个四舍五入合并掉。
+func throttleScaleUp(limit, permille int32) int32 {
+	if permille <= 0 || permille >= 1000 {
+		return limit
+	}
+	throttled := int32(math.Ceil(float64(limit) * float64(permille) / 1000))
+	if throttled < 1 {
+		return 1
+	}
+	if throttled > limit {
+		return limit
+	}
+	return throttled
 }
 
 // EffectiveTargetWarmBuffer 返回生效的缓冲值。

@@ -52,7 +52,7 @@ gantt
 | 生命周期完整化 | TTL / 空闲 / 心跳（Lease）/ 冻结（L1） |
 | Finalizer 链 + 泄漏对账 | 5 个 Finalizer + Sweeper CronJob |
 | `sandbox-gateway` | REST API、鉴权、配额、幂等键、错误语义 |
-| 保护模式 | 雪崩保护（[05 §5](05-warm-pool-and-scaling.md)） |
+| 保护模式 | 雪崩保护（[05 §5](05-warm-pool-and-scaling.md)）：失败率触发 + 滞回 + 扩容限速 + 接入层拒绝低优。**边界：API 延迟判据与高优排队未接线**（见 05 §5 实现状态表） |
 | 容器镜像 | 三个组件共用一个多阶段 `Dockerfile`（distroless 运行时、多架构）；**尚未在可用运行时上构建过** |
 | 控制面部署清单 | `config/manager/`（Deployment + 指标 Service + PDB，含 leader election 与探针）；**仅渲染验证，且待补 PVC 权限** |
 

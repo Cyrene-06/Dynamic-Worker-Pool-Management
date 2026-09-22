@@ -547,3 +547,97 @@ func TestHibernation_RequestsAreMutuallyExclusive(t *testing.T) {
 		t.Fatalf("唤醒后必须清掉休眠标记，否则两个矛盾的标记会让人无从判断")
 	}
 }
+
+// setProtectMode 模拟控制器把池置入（或退出）保护模式。
+//
+// 测试直接写 status 而不是自己拍一个判定：接入层**不该**有第二套判定，
+// 它只读一个事实。这个测试守的就是那件事。
+func setProtectMode(t *testing.T, c client.Client, active bool, reason string) {
+	t.Helper()
+	ctx := context.Background()
+
+	var pool sandboxv1alpha1.SandboxPool
+	if err := c.Get(ctx, types.NamespacedName{Name: poolA}, &pool); err != nil {
+		t.Fatalf("读取池失败: %v", err)
+	}
+	pool.Status.ProtectMode.Active = active
+	pool.Status.ProtectMode.Reason = reason
+	if err := c.Status().Update(ctx, &pool); err != nil {
+		t.Fatalf("写池 status 失败: %v", err)
+	}
+}
+
+// errorCodeOf 解析响应体里的错误码（非错误响应返回空串）。
+func errorCodeOf(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		return ""
+	}
+	return body.Error.Code
+}
+
+// TestProtectMode_RejectsLowPriorityOnly 守雪崩保护的接入层强制（docs/05 §5）。
+//
+// 三个断言方向都很关键，任一个写反都会把保护机制变成故障源：
+//   - 低优被拒（否则保护只是写了个 status，没有任何作用）
+//   - 高优不被拒（否则保护机制本身会让平台不可用）
+//   - 优先级未知不被拒（否则任何一个拼错的类名都会让业务被拒）
+func TestProtectMode_RejectsLowPriorityOnly(t *testing.T) {
+	srv, c := newTestServer(t)
+	h := srv.Handler()
+
+	batchBody := `{"pool":"fc-small","priorityClassName":"sandbox-batch","allowColdPath":true}`
+
+	// 保护之前：批处理申请应当被正常受理。
+	// 没有这个对照用例，后面那条断言可能只是因为请求根本就走不通而通过。
+	rec := do(t, h, http.MethodPost, "/v1/sandboxes", tokenA, "idem-p0", batchBody)
+	if got := errorCodeOf(t, rec); got == CodeProtectMode {
+		t.Fatalf("未进入保护模式时不应以保护为由拒绝（code=%s body=%s）", got, rec.Body.String())
+	}
+
+	setProtectMode(t, c, true, "ProvisionFailureRate")
+
+	// 低优：503 + protect_mode + Retry-After + protectReason。
+	rec = do(t, h, http.MethodPost, "/v1/sandboxes", tokenA, "idem-p1", batchBody)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("保护期内低优申请状态码 = %d，期望 503，body=%s", rec.Code, rec.Body.String())
+	}
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应体不是合法 JSON: %v", err)
+	}
+	if body.Error.Code != CodeProtectMode {
+		t.Fatalf("错误码 = %q，期望 %q（不能与 pool_exhausted 混用：两者的排查方向相反）",
+			body.Error.Code, CodeProtectMode)
+	}
+	if body.Error.Details["protectReason"] != "ProvisionFailureRate" {
+		t.Fatalf("必须回带 protectReason（哪些原因在防护是排查的起点），实际 %v", body.Error.Details)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("保护模式必须带 Retry-After：否则业务只能盲目重试")
+	}
+
+	// 高优：不得被保护模式拒绝。
+	rec = do(t, h, http.MethodPost, "/v1/sandboxes", tokenA, "idem-p2",
+		`{"pool":"fc-small","priorityClassName":"sandbox-interactive","allowColdPath":true}`)
+	if got := errorCodeOf(t, rec); got == CodeProtectMode {
+		t.Fatalf("高优申请不得被保护模式拒绝，否则保护机制本身就是可用性故障（body=%s）",
+			rec.Body.String())
+	}
+
+	// 优先级未知/为空：按**放行**处理。
+	rec = do(t, h, http.MethodPost, "/v1/sandboxes", tokenA, "idem-p3",
+		`{"pool":"fc-small","allowColdPath":true}`)
+	if got := errorCodeOf(t, rec); got == CodeProtectMode {
+		t.Fatalf("优先级未知时必须放行：误拒正常业务比漏掉一个批处理严重得多（body=%s）",
+			rec.Body.String())
+	}
+
+	// 退出保护：低优申请恢复。
+	setProtectMode(t, c, false, "")
+	rec = do(t, h, http.MethodPost, "/v1/sandboxes", tokenA, "idem-p4", batchBody)
+	if got := errorCodeOf(t, rec); got == CodeProtectMode {
+		t.Fatalf("退出保护后不得再拒绝低优申请（body=%s）", rec.Body.String())
+	}
+}

@@ -186,6 +186,15 @@ spec:
     - { className: sandbox-batch,       minWarmShare: 0.3 }
   # ---- 维护 ----
   drain: {}                      # 由运维写入 { enabled: true, reason: "kata upgrade" }
+  # ---- 雪崩保护（docs/05 §5）----
+  protectMode:
+    enabled: true                 # 默认 true；用 *bool 以免"忘记设置"静默关掉保护
+    failureRatePercent: 30        # provision 失败率阈值（分母：inflight + failed）
+    minSamples: 10                # 样本不足时不做判定（防 1/1 = 100% 误触发）
+    apiserverLatencyThresholdMs: 2000
+    holdSeconds: 120              # 滞回：进入后至少保持这么久，持续故障则不断续期
+    scaleUpThrottlePermille: 500  # 保护期内扩容限速降至 50%
+    maxQueueDepth: 200            # 预留：接入层当前快速失败（见下方边界 ③）
 status:
   warm: 142                      # 未认领且 Ready
   claimed: 61
@@ -207,9 +216,22 @@ status:
     at: "2026-09-22T09:14:03Z"
     reason: DemandTrendUp
     delta: +20
+  protectMode:
+    active: false
+    reason: ""                    # ProvisionFailureRate | ApiserverLatency | HoldActive
+    since: null                   # 本次（或最近一次）进入保护的时刻
+    until: null                   # 滞回期结束时刻
+    trips: 0                      # 累计进入次数（持续增长 = 阈值偏低或未真恢复）
+    failureRatePermille: 0        # 本次判定用的失败率，供事后复盘
 ```
 
 > **`SandboxPool` 暴露 `/scale` 子资源**（`spec.scaling.targetWarm` ↔ `status.warm`），供 KEDA/HPA 可选叠加驱动（见 [02](02-tech-selection.md) D5）。
+
+> **保护模式的实现边界**（不要把上面这份 schema 读成"阈值都已生效"）：
+>
+> ① 失败率的分母是 `inflight + failed`，**不是**严格的 60s 滑动窗口。严格滑窗需要控制器持有内存时间序列，而那种计数器会在重启后清零 —— 恰好在最需要保护的时刻失效；从对象状态推导没有这个性质，代价是它只能看到"当前仍处于 inflight/failed 的对象"。
+> ② API Server 延迟判据已定义并参与判定，但控制器的延迟观测**尚未接线**（与 `nodeHeadroom` 一样显式上报"未知"，M3 接入指标管线后补齐）。因此当前实际生效的触发条件只有失败率。
+> ③ "高优申请排队（≤200 并发）"未实现：接入层目前是**快速失败**，是否引入排队仍是 [10](10-roadmap-risks.md) Q8 的开放问题。`maxQueueDepth` 因此暂时只是一个对外承诺的上限记录 —— 保留一个不会被读取的字段是有代价的（会被误认为已生效），若 Q8 结案为"继续快速失败"则应删除它。
 
 ---
 

@@ -179,6 +179,12 @@ func (s *Store) now() time.Time {
 func (s *Store) ClaimWarm(ctx context.Context, p Principal, req CreateRequest, requestID string) (*SandboxResponse, *APIError) {
 	started := s.now()
 
+	// 雪崩保护优先于认领：保护期内低优申请一律不受理，包括从池里认领。
+	// 库存要留给高优业务 —— "池里还有货"并不能回答"现在是不是该继续放量"。
+	if aerr := s.protectGate(ctx, req.Pool, req.PriorityClassName); aerr != nil {
+		return nil, aerr
+	}
+
 	var hardDeadline *metav1.Time
 	if req.HardDeadline != nil {
 		hd := metav1.NewTime(*req.HardDeadline)
@@ -224,12 +230,51 @@ func (s *Store) claimer() *claim.Claimer {
 	return &claim.Claimer{Client: s.Client, Namespace: s.ns()}
 }
 
+// protectRetryAfter 是保护模式期间建议的退避时长（文档值：Retry-After: 10）。
+const protectRetryAfter = 10 * time.Second
+
+// protectGate 在池处于雪崩保护时拒绝低优申请（docs/05 §5），返回 nil 表示放行。
+//
+// 判定读的是**池的 status**，而不是在接入层自己算一遍：同一个事实只能有一个
+// 来源。两边各算必然会在某一轮出现分歧，而分歧的表现形式（控制器认为已恢复、
+// gateway 仍在拒绝）从任一组件都解释不了，而排查它要花掉危机里最宝贵的时间。
+//
+// 它能放在热路径上的前提：读池走的是 manager 的**缓存** client（cmd/gateway
+// 用 manager 而不是裸 client 就是为了拿到带缓存的读），因此这里不会给
+// API Server 增加每请求一次的额外压力 —— 而那恰恰是保护模式要缓解的东西。
+//
+// 失败方向刻意是**开放**的：读不到池、状态未知、优先级未知，一律放行。
+// 误拒一个正常业务（可用性事故）比放行一个批处理（多占一点冷路径容量）
+// 严重得多，因此这里与"跨租户复用硬编码禁止"那类安全边界取相反方向。
+func (s *Store) protectGate(ctx context.Context, poolName, priorityClass string) *APIError {
+	if !sandboxv1alpha1.IsLowPriorityClass(priorityClass) {
+		return nil
+	}
+
+	var pool sandboxv1alpha1.SandboxPool
+	if err := s.Client.Get(ctx, types.NamespacedName{Name: poolName}, &pool); err != nil {
+		// 读不到（含 NotFound）时放行：让下游路径去给出"池不存在"这类准确的错误，
+		// 而不是在这里把两种原因混成一个 503。
+		return nil
+	}
+	if !pool.Status.ProtectMode.Active {
+		return nil
+	}
+	return errProtectMode(protectRetryAfter, pool.Status.ProtectMode.Reason)
+}
+
 // CreateCold 创建一个直接归属于业务的新沙箱（冷路径）。
 //
 // 它与热路径的关键差别：**不经过 Ready 阶段**。控制器看到 claim 非空
 // 就会把它推进到 Running，因此不存在"刚建好就被别人认领"的窗口。
 func (s *Store) CreateCold(ctx context.Context, p Principal, req CreateRequest, requestID string) (*SandboxResponse, *APIError) {
 	started := s.now()
+
+	// 冷路径是保护模式最想拦住的那条路：它会在容量危机里继续向 API Server
+	// 与节点施压，而正是这个压力让系统自我放大。
+	if aerr := s.protectGate(ctx, req.Pool, req.PriorityClassName); aerr != nil {
+		return nil, aerr
+	}
 
 	var pool sandboxv1alpha1.SandboxPool
 	if err := s.Client.Get(ctx, types.NamespacedName{Name: req.Pool}, &pool); err != nil {

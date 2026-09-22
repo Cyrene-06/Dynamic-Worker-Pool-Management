@@ -151,6 +151,13 @@ const (
 	CondScalingReady     = "ScalingReady"
 	CondNodeCapacity     = "NodeCapacitySufficient"
 	CondRuntimeAvailable = "RuntimeClassAvailable"
+	// CondProtectModeNormal 为 True 表示未处于雪崩保护状态。
+	//
+	// 命名沿用“条件类型是正面陈述”的约定（与 NodeCapacitySufficient 一致）：
+	// 处于保护时为 False。这样告警与 kubectl 读到的都是同一句式 ——
+	// 若反过来用 ProtectModeActive=True 表示“已进入保护”，
+	// 那么“True 是好是坏”就得靠记住具体条件名，而那种记忆在危机里不可靠。
+	CondProtectModeNormal = "ProtectModeNormal"
 )
 
 // ---------------------------------------------------------------------------

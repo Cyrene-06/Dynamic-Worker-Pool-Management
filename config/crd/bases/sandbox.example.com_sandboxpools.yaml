@@ -136,6 +136,75 @@ spec:
                   type: object
                 maxItems: 4
                 type: array
+              protectMode:
+                description: ProtectMode 是雪崩保护配置（docs/05 §5）。
+                properties:
+                  apiserverLatencyThresholdMs:
+                    default: 2000
+                    description: ApiserverLatencyThresholdMs 是 API Server P99 阈值（毫秒）。
+                    format: int32
+                    minimum: 100
+                    type: integer
+                  enabled:
+                    default: true
+                    description: |-
+                      Enabled 关闭后完全不做保护模式判定（留一个显式的开关，
+                      而不是让运维去把阈值改成不可能达到的值）。
+
+                      用 *bool 而不是 bool：这个字段的默认值是 true，而 bool 的零值
+                      与显式 false 无法区分 —— 任何不经过 API Server 默认化的写入
+                      （单测构造对象、部分 SSA 场景、直接改对象）都会静默关掉雪崩保护。
+                      "安全机制被静默关闭"是最不该发生的一类问题，因此多一个指针是值得的。
+                    type: boolean
+                  failureRatePercent:
+                    default: 30
+                    description: FailureRatePercent 是 provision 失败率阈值（百分比）。
+                    format: int32
+                    maximum: 100
+                    minimum: 1
+                    type: integer
+                  holdSeconds:
+                    default: 120
+                    description: |-
+                      HoldSeconds 是进入保护后的最短持续时间（滞回，防抖动）。
+
+                      没有滞回的保护模式会变成振荡器：危机时进、一缓解就出，
+                      每次进出都伴随一批请求被拒绝/放行。而它的目的是争取恢复时间，
+                      不是逐秒反映健康度。
+                    format: int32
+                    minimum: 10
+                    type: integer
+                  maxQueueDepth:
+                    default: 200
+                    description: |-
+                      MaxQueueDepth 是保护期内高优申请的排队上限（docs/05 §5 的 200）。
+
+                      当前接入层是**快速失败**而非排队（docs/10 Q8 尚未结案），
+                      因此这个值暂时只作为对外承诺的上限记录在 API 里：
+                      将来若实现排队，它必须被真正执行；若继续快速失败，它应被删除。
+                      保留一个不会被读取的字段是有代价的 —— 它会被误认为已经生效。
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  minSamples:
+                    default: 10
+                    description: |-
+                      MinSamples 是判定失败率所需的最小样本数。
+
+                      没有它的保护模式会在“1 次尝试、1 次失败”上立刻触发，而保护模式
+                      本身是有代价的（拒绝低优申请）—— 一个刚扩容、库存尚在创建中的池
+                      恰好就是这种形态，于是正常扩容会被自己的保护机制打断。
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  scaleUpThrottlePermille:
+                    default: 500
+                    description: ScaleUpThrottlePermille 是保护期内扩容限速的比例（500 = 降至 50%）。
+                    format: int32
+                    maximum: 1000
+                    minimum: 100
+                    type: integer
+                type: object
               scaling:
                 description: |-
                   SandboxPoolScaling 是池水位策略。
@@ -372,6 +441,41 @@ spec:
               predictedDemand:
                 format: int32
                 type: integer
+              protectMode:
+                description: |-
+                  ProtectMode 是保护模式的当前状态（docs/05 §5）。
+
+                  放在池的 status 里而不是让各组件各自算：控制面与接入层必须看到
+                  **同一个事实**。否则会出现“控制器认为已恢复、gateway 仍在拒绝”这类
+                  从任一组件都解释不了的现象，而排查它要花掉危机里最宝贵的时间。
+                properties:
+                  active:
+                    description: Active 表示保护模式正在生效。
+                    type: boolean
+                  failureRatePermille:
+                    description: |-
+                      FailureRatePermille 是本次判定用的失败率（千分比），便于事后复盘
+                      “当时到底多糟”。
+                    format: int32
+                    type: integer
+                  reason:
+                    description: Reason 是进入保护的原因码（枚举，避免成为高基数 label）。
+                    type: string
+                  since:
+                    description: Since 是本次（或最近一次）进入保护的时刻。
+                    format: date-time
+                    type: string
+                  trips:
+                    description: |-
+                      Trips 是累计进入次数。它比 active 更有信息量：短时间内持续增长
+                      说明阈值偏低或故障未真正恢复，而 active=true 这两个原因长得一样。
+                    format: int64
+                    type: integer
+                  until:
+                    description: Until 是滞回期结束时刻；在此之前即使触发条件消失也保持保护。
+                    format: date-time
+                    type: string
+                type: object
               saturationPermille:
                 description: SaturationPermille 是饱和度 claimed/(warm+claimed)，千分比。
                 format: int32

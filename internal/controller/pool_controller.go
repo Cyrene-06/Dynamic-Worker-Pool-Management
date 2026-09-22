@@ -101,6 +101,33 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// ---- 保护模式（雪崩保护，docs/05 §5）----
+	//
+	// 判定放在所有分支之前：它要进 status，而接入层（gateway）读的就是
+	// 那个字段来决定“保护期内谁被拒绝”。同一个事实只能有一个来源，
+	// 否则会出现“控制器认为已恢复、gateway 仍在拒绝”这类无法解释的现象。
+	//
+	// 放在排空分支之前也是有意的：排空期间仍然可能有存活会话在失败，
+	// 而“保护状态”在排空结束后还需要继续可见 —— 否则一次维护窗口
+	// 会把上一轮的告警悄悄滑掉。
+	protect := EvaluateProtectMode(pool.Spec.ProtectMode, ProtectObservation{
+		Now:      r.now(),
+		Inflight: counts.inflight,
+		Failed:   counts.failed,
+		// API Server 延迟观测需要一个进程级的时间序列来源，
+		// 而 client-go 的直方图并不落在 controller-runtime 的 registry 里、
+		// 无法直接读取。因此这里如实上报“未知”，而不是填 0：
+		// 填 0 会让“不知道”与“非常健康”长得完全一样，
+		// 而保护模式恰恰是在监控出问题的时候最需要工作。
+		// 处理方式与 NodeHeadroom 一致（显式上报未知，M3 接入指标管线）。
+		LatencyKnown: false,
+		PrevActive:   pool.Status.ProtectMode.Active,
+		PrevSince:    metav1TimeOrZero(pool.Status.ProtectMode.Since),
+		PrevUntil:    metav1TimeOrZero(pool.Status.ProtectMode.Until),
+		PrevTrips:    pool.Status.ProtectMode.Trips,
+	})
+	r.applyProtectMode(&pool, protect)
+
 	// ---- 排空：优先于一切自动决策 ----
 	if pool.Spec.Drain.Enabled {
 		return r.reconcileDrain(ctx, &pool, counts)
@@ -152,6 +179,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		HitRatioPermille:     r.hitRatio(&pool),
 		OscillationReversals: r.reversals(pool.Name),
 		NodeHeadroom:         -1, // 节点容量观测需 Karpenter/CA 指标，M3 接入
+		ProtectActive:        protect.Active,
 	}
 	if pool.Status.LastScaleDecision != nil {
 		o.LastScaleDelta = pool.Status.LastScaleDecision.Delta
@@ -486,6 +514,69 @@ func (r *PoolReconciler) updateStatus(ctx context.Context, pool *sandboxv1alpha1
 	// 只在实质变化时写：status 写入会触发所有 watcher，
 	// 5k 规模下"每轮都写一次"的代价非常具体。
 	return r.Status().Update(ctx, pool)
+}
+
+// applyProtectMode 把保护模式的判定结果写进 status，并在**状态变化时**发事件。
+//
+// 只在变化时发事件：一场持续 10 分钟的危机若每轮都发一条，会刷出几百条
+// 相同事件，把真正需要看的东西挤出事件流 —— 而事件流正是危机中最先被读的东西。
+func (r *PoolReconciler) applyProtectMode(pool *sandboxv1alpha1.SandboxPool, d ProtectDecision) {
+	st := &pool.Status.ProtectMode
+	st.Active = d.Active
+	st.Reason = d.Reason
+	st.Trips = d.Trips
+	st.FailureRatePermille = d.FailureRatePermille
+	if !d.Since.IsZero() {
+		t := metav1.NewTime(d.Since)
+		st.Since = &t
+	}
+	if !d.Until.IsZero() {
+		t := metav1.NewTime(d.Until)
+		st.Until = &t
+	} else {
+		st.Until = nil
+	}
+
+	// Condition 用“正面陈述”：ProtectModeNormal=False 即处于保护中。
+	r.setCondition(pool, sandboxv1alpha1.CondProtectModeNormal, !d.Active, d.Reason,
+		protectMessage(d))
+
+	switch {
+	case d.TrippedNow:
+		r.Recorder.Eventf(pool, corev1.EventTypeWarning, "ProtectModeEnabled",
+			"进入雪崩保护: reason=%s failureRate=%d‰ hold=%s（低优申请将被拒绝，扩容限速降至 %d‰）",
+			d.Reason, d.FailureRatePermille,
+			d.Until.Sub(d.Since).Truncate(time.Second), d.ThrottlePermille)
+	case d.RecoveredNow:
+		r.Recorder.Eventf(pool, corev1.EventTypeNormal, "ProtectModeDisabled",
+			"退出雪崩保护: 累计进入 %d 次", d.Trips)
+	}
+}
+
+// protectMessage 生成给运维看的一句话。
+//
+// 刻意包含“还要持续多久”：保护模式生效时，运维最先问的就是
+// “它是会自己好，还是需要我去做什么”。
+func protectMessage(d ProtectDecision) string {
+	if !d.Active {
+		return "未处于雪崩保护"
+	}
+	if d.Reason == ProtectReasonHold {
+		return "触发条件已消失，处于滞回期（自动恢复）"
+	}
+	return fmt.Sprintf("雪崩保护生效（原因 %s，失败率 %d‰），低优申请被拒绝、扩容限速至 %d‰",
+		d.Reason, d.FailureRatePermille, d.ThrottlePermille)
+}
+
+// metav1TimeOrZero 把可选的 metav1.Time 转成 time.Time（nil 即零值）。
+//
+// 零值在这里是有意义的：它表示“上一轮没有进入过保护”，
+// 而不是“进入了但时间未知”——后者在状态机里必须被当作已经过期。
+func metav1TimeOrZero(t *metav1.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return t.Time
 }
 
 func (r *PoolReconciler) setCondition(pool *sandboxv1alpha1.SandboxPool, condType string, ok bool, reason, msg string) {

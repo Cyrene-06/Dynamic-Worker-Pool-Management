@@ -325,6 +325,10 @@ func TestWriteError_StatusCodeAndRetryAfter(t *testing.T) {
 		{"配额", errQuotaExceeded("x", time.Second), http.StatusTooManyRequests, CodeQuotaExceeded, true},
 		{"限流", errRateLimited("x", time.Second), http.StatusTooManyRequests, CodeRateLimited, true},
 		{"池空", errPoolExhausted(time.Second), http.StatusServiceUnavailable, CodePoolExhausted, true},
+		// 与池空同为 503，但码必须不同：对业务都是退避重试，
+		// 对运维一个是"调池参数"、另一个是"去看为什么在雪崩"。
+		{"保护模式", errProtectMode(10*time.Second, "ProvisionFailureRate"),
+			http.StatusServiceUnavailable, CodeProtectMode, true},
 		{"容量不足", errInsufficientCapacity("x"), http.StatusInsufficientStorage, CodeInsufficientCap, false},
 		{"内部错误", errInternal("x"), http.StatusInternalServerError, CodeInternal, false},
 	}

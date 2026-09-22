@@ -61,6 +61,7 @@ const (
 	CodeQuotaExceeded    = "quota_exceeded"
 	CodeRateLimited      = "rate_limited"
 	CodePoolExhausted    = "pool_exhausted"
+	CodeProtectMode      = "protect_mode"
 	CodeInsufficientCap  = "insufficient_capacity"
 	CodeInternal         = "internal"
 	CodeIdempotencyReuse = "idempotency_key_reuse"
@@ -159,6 +160,24 @@ func errPoolExhausted(retry time.Duration) *APIError {
 		Code:       CodePoolExhausted,
 		Message:    "池中无可用库存且未启用冷路径",
 		RetryAfter: retry,
+	}
+}
+
+// errProtectMode 构造 503（雪崩保护，docs/05 §5）。
+//
+// 为什么单独一个码而不是复用 pool_exhausted（两者都是 503 + Retry-After）：
+// 对业务来说两者都是"退避重试"，因此状态码相同是对的；但对**运维**来说
+// 排查方向完全相反 —— 一个是"池不够用，去调池参数"，另一个是
+// "平台正在自保，去看为什么在雪崩"。复用会让保护模式期间的所有 503
+// 看起来都像容量问题，而那正是最容易被误判的一类混淆。
+func errProtectMode(retry time.Duration, reason string) *APIError {
+	return &APIError{
+		Status:     http.StatusServiceUnavailable,
+		Code:       CodeProtectMode,
+		Message:    "平台处于雪崩保护中，低优先级申请暂不被受理",
+		RetryAfter: retry,
+		// reason 是枚举（控制器写入 status 的原因码），不会造成高基数。
+		Details: map[string]string{"protectReason": reason},
 	}
 }
 

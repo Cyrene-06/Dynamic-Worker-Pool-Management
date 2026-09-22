@@ -87,3 +87,27 @@ const (
 	TierMedium = "medium"
 	TierLarge  = "large"
 )
+
+// 优先级类别名称。与集群里的 PriorityClass 对象同名（docs/05 §5）。
+//
+// 与 Label 一样集中定义：gateway 用它们决定"保护模式下谁被拒绝"，
+// 控制器用它们解释 PriorityBands 的份额。两端各写一份字符串字面量，
+// 迟早会出现"常量改了、另一边没改"的静默不匹配 —— 而那个 bug 的表现
+// 是低优请求在保护模式下被放行，属于稳定性问题，且只在危机时刻才暴露。
+const (
+	PriorityInteractive = "sandbox-interactive"
+	PriorityBatch       = "sandbox-batch"
+	PrioritySystem      = "sandbox-system"
+)
+
+// IsLowPriorityClass 判定一个优先级类别是否属于"保护模式下应当拒绝"的低优类别。
+//
+// 只把 batch 归为低优，而不是"非 interactive 的都算低优"，因为两者的
+// 代价不对称：保护模式下误拒一个正常业务是**可用性事故**，放行一个批处理
+// 只是多占一点冷路径容量。所以未知/空值一律按"不拒绝"处理。
+//
+// 这正是与"跳租户复用硬编码禁止"不同的一类取舍：那条是安全边界（必须保守），
+// 这条是可用性权衡（宁可漏掉一个批处理）。
+func IsLowPriorityClass(class string) bool {
+	return class == PriorityBatch
+}
