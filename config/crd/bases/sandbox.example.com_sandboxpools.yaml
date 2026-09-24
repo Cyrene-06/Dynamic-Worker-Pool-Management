@@ -205,6 +205,11 @@ spec:
                     minimum: 100
                     type: integer
                 type: object
+              runtimeClassName:
+                description: |-
+                  RuntimeClassName 可在 Kata 升级期间覆盖该池的具体版本化 RuntimeClass。
+                  留空时使用隔离级别映射；控制器会校验 handler 与隔离级别一致。
+                type: string
               scaling:
                 description: |-
                   SandboxPoolScaling 是池水位策略。

@@ -284,6 +284,9 @@ spec:
                 required:
                 - name
                 type: object
+              runtimeClassName:
+                description: RuntimeClassName 由池或 Gateway 复制，锁定创建时的运行时版本。
+                type: string
               state:
                 description: State 是状态外置配置（L3）。
                 properties:

@@ -122,6 +122,10 @@ powershell -ExecutionPolicy Bypass -File hack/kind-e2e.ps1 -Stage cluster,image,
 一致性验证，因此下面的退出标准仍全部未勾选。部署入口见
 [M2 E2 节点部署](11-m2-e2-bootstrap.md)。
 
+**后续仓库实现**：Cilium 出口档位渲染、T1–T9 E2 执行器、延迟/密度报告生成器与
+RuntimeClass 切换回滚演练脚本已加入。实测报告仍为[待采集](../reports/m2-e2-baseline.md)，
+不能据此勾选下方退出标准。
+
 | 交付物 | 说明 |
 |---|---|
 | E2 单节点 KVM 环境 | 节点初始化脚本、kubeadm、Cilium、kata-deploy |

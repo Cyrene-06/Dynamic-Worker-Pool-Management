@@ -40,6 +40,7 @@
 - **多环境部署方案**: [docs/09-deployment-environments.md](docs/09-deployment-environments.md)
 - **里程碑与风险登记**: [docs/10-roadmap-risks.md](docs/10-roadmap-risks.md)
 - **M2 E2 节点部署与 node-agent**: [docs/11-m2-e2-bootstrap.md](docs/11-m2-e2-bootstrap.md)
+- **M2 E2 基线采集状态**: [reports/m2-e2-baseline.md](reports/m2-e2-baseline.md)
 
 ## 架构速览
 

@@ -166,6 +166,12 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		r.Recorder.Eventf(&pool, corev1.EventTypeWarning, "IsolationDegraded",
 			"请求 %s，实际生效 %s", av.RequestedLevel, av.Level)
 	}
+	if pool.Spec.RuntimeClassName != "" && av.Degraded {
+		return ctrl.Result{}, fmt.Errorf("池 %s 指定 RuntimeClass %s，不允许降级到 %s", pool.Name, pool.Spec.RuntimeClassName, av.Level)
+	}
+	if err := validateRuntimeClassOverride(ctx, r.Client, pool.Spec.Isolation, pool.Spec.RuntimeClassName); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// ---- 阶段三：决策 ----
 	o := ScaleObservation{
@@ -352,10 +358,11 @@ func (r *PoolReconciler) newStockSandbox(pool *sandboxv1alpha1.SandboxPool, tmpl
 			},
 		},
 		Spec: sandboxv1alpha1.AgentSandboxSpec{
-			PoolRef:     sandboxv1alpha1.NameRef{Name: pool.Name},
-			TemplateRef: sandboxv1alpha1.NameRef{Name: pool.Spec.TemplateRef.Name},
-			Tier:        pool.Spec.Tier,
-			Isolation:   pool.Spec.Isolation,
+			PoolRef:          sandboxv1alpha1.NameRef{Name: pool.Name},
+			TemplateRef:      sandboxv1alpha1.NameRef{Name: pool.Spec.TemplateRef.Name},
+			Tier:             pool.Spec.Tier,
+			Isolation:        pool.Spec.Isolation,
+			RuntimeClassName: pool.Spec.RuntimeClassName,
 			// Claim 留空 —— 这就是"库存"的定义。
 		},
 	}

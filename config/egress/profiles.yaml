@@ -1,0 +1,11 @@
+# Platform-owned. SandboxTemplate.spec.egressProfile selects one of these profiles.
+profiles:
+  default-llm:
+    matchNames:
+      - llm-gw.internal
+      - pypi.org
+    matchPatterns:
+      - "*.pypi.org"
+      - "*.files.pythonhosted.org"
+      - "*.amazonaws.com"
+    ports: [443]

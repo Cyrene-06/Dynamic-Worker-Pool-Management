@@ -27,6 +27,8 @@ type AgentSandboxSpec struct {
 	// 因此同一份 spec 可跨环境平移。
 	// +kubebuilder:validation:Enum=simulated;runc;kata-fc;kata-clh
 	Isolation IsolationLevel `json:"isolation,omitempty"`
+	// RuntimeClassName 由池或 Gateway 复制，锁定创建时的运行时版本。
+	RuntimeClassName string `json:"runtimeClassName,omitempty"`
 
 	// Claim 为空表示这是池中库存；非空表示已被认领。
 	//

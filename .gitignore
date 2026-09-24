@@ -14,6 +14,8 @@ coverage.txt
 coverage.out
 *.prof
 *.coverprofile
+__pycache__/
+*.pyc
 
 # ---- 代码生成产物 ----
 # 注意：zz_generated.deepcopy.go 必须入库（类型要满足 runtime.Object，

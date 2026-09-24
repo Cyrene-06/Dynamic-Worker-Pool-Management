@@ -40,5 +40,6 @@ helm upgrade --install kata-deploy \
 kubectl apply -k "$REPO_ROOT/config/crd"
 kubectl apply -f "$REPO_ROOT/config/samples/namespaces.yaml"
 kubectl apply -k "$REPO_ROOT/config/runtimeclass"
+kubectl apply -k "$REPO_ROOT/config/egress"
 kubectl apply -k "$REPO_ROOT/config/node-agent"
 echo "E2 resources installed on $NODE_NAME. Replace the node-agent dev image with a built immutable tag before rollout."

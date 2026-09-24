@@ -36,8 +36,8 @@ scheduling:
       value: "true"
       effect: NoSchedule
 ---
-# Keep this alongside kata-fc during upgrades. Switch the kata-fc mapping in
-# config/isolation/levels.yaml only after the new nodes have this label.
+# Keep this alongside kata-fc during upgrades. After new nodes have this
+# runtime-version label, set the target SandboxPool.spec.runtimeClassName.
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:

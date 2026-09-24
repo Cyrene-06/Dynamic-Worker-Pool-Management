@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -70,12 +71,14 @@ func (r *SandboxReconciler) finalizeLeaseCleanup(ctx context.Context, sbx *sandb
 	return client.IgnoreNotFound(r.Delete(ctx, &lease))
 }
 
-// finalizeNetworkCleanup 删除该沙箱的网络策略。
+// finalizeNetworkCleanup 将策略收紧为全拒绝。策略保留到沙箱对象删除后由 GC 清理，
+// 因为后续 state-flush 仍需读取 Pod 数据；提前删策略会重新开放网络。
 //
 // 先断网再落盘（docs/04 §6.2）：否则落盘过程中沙箱仍可对外发送数据。
-// 这里只清理核心 NetworkPolicy；Cilium 的 CNP 在 M2 引入 Cilium 后一并纳管
-// （见 docs/06 §7），在那之前不假装清理了一个并不存在的对象。
 func (r *SandboxReconciler) finalizeNetworkCleanup(ctx context.Context, sbx *sandboxv1alpha1.AgentSandbox) error {
+	if err := r.quarantineCiliumPolicy(ctx, sbx); err != nil {
+		return err
+	}
 	var list networkingv1.NetworkPolicyList
 	if err := r.List(ctx, &list,
 		client.InNamespace(sbx.Namespace),
@@ -86,7 +89,16 @@ func (r *SandboxReconciler) finalizeNetworkCleanup(ctx context.Context, sbx *san
 	); err != nil {
 		return fmt.Errorf("列出网络策略失败: %w", err)
 	}
-	return r.deleteAll(ctx, &list)
+	for i := range list.Items {
+		np := &list.Items[i]
+		np.Spec.PolicyTypes = []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress}
+		np.Spec.Ingress = nil
+		np.Spec.Egress = nil
+		if err := r.Update(ctx, np); err != nil {
+			return fmt.Errorf("收紧网络策略 %s: %w", np.Name, err)
+		}
+	}
+	return nil
 }
 
 // finalizeStateFlush 触发状态外置落盘。
@@ -217,10 +229,6 @@ func extractItems(list client.ObjectList) ([]client.Object, error) {
 // 默认拒绝 + 显式放通 gateway，而不是"先开着以后再收紧"：
 // 后者在实践中的结果几乎总是"以后再也没收紧过"。这里哪怕只放通一条，
 // 也已经把"任何同集群 Pod 都能连进沙箱"这个默认行为关掉了。
-//
-// 出站治理（LLM 白名单等）依赖 Cilium 的 FQDN 能力，属于 M2（docs/06 §7）。
-// 在那之前这里不写一条"看起来治理了出口其实没生效"的规则 ——
-// 那比没有规则更危险，因为它会让人以为已经防住了。
 func (r *SandboxReconciler) ensureNetworkPolicy(ctx context.Context, sbx *sandboxv1alpha1.AgentSandbox) error {
 	name := sbx.Name
 	np := &networkingv1.NetworkPolicy{
@@ -244,6 +252,7 @@ func (r *SandboxReconciler) ensureNetworkPolicy(ctx context.Context, sbx *sandbo
 					NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						"kubernetes.io/metadata.name": sandboxv1alpha1.NamespaceSystem,
 					}},
+					PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "sandbox-gateway"}},
 				}},
 			}},
 		},
@@ -251,8 +260,17 @@ func (r *SandboxReconciler) ensureNetworkPolicy(ctx context.Context, sbx *sandbo
 	if err := controllerutil.SetControllerReference(sbx, np, r.Scheme); err != nil {
 		return err
 	}
-	if err := r.Create(ctx, np); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("创建网络策略失败: %w", err)
+	var existing networkingv1.NetworkPolicy
+	err := r.Get(ctx, types.NamespacedName{Namespace: sbx.Namespace, Name: name}, &existing)
+	if apierrors.IsNotFound(err) {
+		return r.Create(ctx, np)
 	}
-	return nil
+	if err != nil {
+		return fmt.Errorf("读取网络策略失败: %w", err)
+	}
+	if reflect.DeepEqual(existing.Spec, np.Spec) {
+		return nil
+	}
+	existing.Spec = np.Spec
+	return r.Update(ctx, &existing)
 }

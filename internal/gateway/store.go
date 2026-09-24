@@ -304,6 +304,10 @@ func (s *Store) CreateCold(ctx context.Context, p Principal, req CreateRequest, 
 	if req.Isolation != "" {
 		isolation = sandboxv1alpha1.IsolationLevel(req.Isolation)
 	}
+	runtimeClassName := ""
+	if isolation == pool.Spec.Isolation {
+		runtimeClassName = pool.Spec.RuntimeClassName
+	}
 
 	deadline := req.HardDeadline
 	if deadline == nil && req.TTLSeconds > 0 {
@@ -344,11 +348,12 @@ func (s *Store) CreateCold(ctx context.Context, p Principal, req CreateRequest, 
 			},
 		},
 		Spec: sandboxv1alpha1.AgentSandboxSpec{
-			PoolRef:     sandboxv1alpha1.NameRef{Name: req.Pool},
-			TemplateRef: sandboxv1alpha1.NameRef{Name: pool.Spec.TemplateRef.Name},
-			Tier:        tier,
-			Isolation:   isolation,
-			Lifecycle:   lifecycle,
+			PoolRef:          sandboxv1alpha1.NameRef{Name: req.Pool},
+			TemplateRef:      sandboxv1alpha1.NameRef{Name: pool.Spec.TemplateRef.Name},
+			Tier:             tier,
+			Isolation:        isolation,
+			RuntimeClassName: runtimeClassName,
+			Lifecycle:        lifecycle,
 			Claim: &sandboxv1alpha1.ClaimSpec{
 				RequestedBy: sandboxv1alpha1.ClaimRequestedBy{
 					Tenant:    p.Tenant,

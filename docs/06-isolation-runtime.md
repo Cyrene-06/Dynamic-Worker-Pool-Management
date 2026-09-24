@@ -82,7 +82,7 @@ metadata:
 handler: kata-fc
 ```
 
-**策略**：节点升级期间，新旧两版 `RuntimeClass` 并存；`SandboxPool` 通过 `isolation.runtimeClassName` 切换；旧池 drain 完成后再删除旧 RuntimeClass。这样升级不会出现"新沙箱落到未升级节点"的混合状态。
+**策略**：节点升级期间，新旧两版 `RuntimeClass` 并存；目标 `SandboxPool` 通过 `spec.runtimeClassName` 切换，先 drain 旧库存，再让新库存使用新类；已创建沙箱保留 `spec.runtimeClassName`，不会随池配置改变。旧池 drain 完成后再删除旧 RuntimeClass。`hack/e2/kata_upgrade.py` 实现单池切换与强制回滚记录。
 
 ---
 

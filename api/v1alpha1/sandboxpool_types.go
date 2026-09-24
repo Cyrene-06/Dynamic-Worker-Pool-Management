@@ -225,6 +225,9 @@ type SandboxPoolSpec struct {
 	// Isolation 是该池统一的隔离级别。
 	// +kubebuilder:validation:Enum=simulated;runc;kata-fc;kata-clh
 	Isolation IsolationLevel `json:"isolation"`
+	// RuntimeClassName 可在 Kata 升级期间覆盖该池的具体版本化 RuntimeClass。
+	// 留空时使用隔离级别映射；控制器会校验 handler 与隔离级别一致。
+	RuntimeClassName string `json:"runtimeClassName,omitempty"`
 
 	// NodePoolSelector 把池绑定到节点池（由 Karpenter/CA 维护）。
 	NodePoolSelector map[string]string `json:"nodePoolSelector,omitempty"`

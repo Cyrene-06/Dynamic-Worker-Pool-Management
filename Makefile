@@ -94,6 +94,7 @@ manifests-check: ## 校验全部 kustomize 清单可渲染（不需要集群）
 	kubectl kustomize config/rbac > /dev/null
 	kubectl kustomize config/isolation > /dev/null
 	kubectl kustomize config/runtimeclass > /dev/null
+	kubectl kustomize config/egress > /dev/null
 	kubectl kustomize config/node-agent > /dev/null
 	kubectl kustomize config/samples > /dev/null
 	kubectl kustomize config/manager > /dev/null
@@ -215,6 +216,7 @@ kind-e2e: ## 把已加载的镜像部署到已存在的 kind 集群并等就绪�
 	kubectl apply -k config/samples
 	kubectl apply -k config/rbac
 	kubectl apply -k config/isolation
+	kubectl apply -k config/egress
 	kubectl apply -k config/manager
 	kubectl -n sandbox-system rollout status deployment/sandbox-operator --timeout=180s
 
@@ -242,6 +244,7 @@ sweeper-local: ## 本地干跑一轮对账（只报告不执行）
 deploy-operator: ## 以容器方式部署控制面（需先 make docker-build 与 make kind-load）
 	kubectl apply -k config/rbac
 	kubectl apply -k config/isolation
+	kubectl apply -k config/egress
 	kubectl apply -k config/manager
 
 .PHONY: deploy-gateway
@@ -261,6 +264,7 @@ undeploy: ## 卸载示例资源（保留 CRD）
 	-kubectl delete -k config/manager --ignore-not-found
 	-kubectl delete -k config/samples --ignore-not-found
 	-kubectl delete -k config/isolation --ignore-not-found
+	-kubectl delete -k config/egress --ignore-not-found
 
 ##@ 清理
 

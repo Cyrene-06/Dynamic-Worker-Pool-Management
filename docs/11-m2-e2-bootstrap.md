@@ -15,7 +15,7 @@ sudo -E bash hack/e2/bootstrap.sh
 ```
 
 脚本运行 `hack/bootstrap/node-init.sh`，初始化单节点 kubeadm 集群，安装 Cilium 与
-kata-deploy，再安装 CRD、命名空间、RuntimeClass 和 node-agent。镜像 tag 默认仍为
+kata-deploy，再安装 CRD、命名空间、RuntimeClass、出口档位配置和 node-agent。镜像 tag 默认仍为
 `dev`；在真实 E2 节点发布前，先通过 `make docker-buildx` 推送 node-agent 镜像，并将
 `config/node-agent/daemonset.yaml` 中的镜像替换成不可变 digest。
 
@@ -29,7 +29,7 @@ kata-deploy，再安装 CRD、命名空间、RuntimeClass 和 node-agent。镜�
 `kata-fc-3-4-0`。`overhead` 与 `config/isolation/levels.yaml` 一致：FC 为
 `300m/192Mi`，CLH 为 `300m/256Mi`。调度约束要求节点隔离标签和 `sandbox=true`
 污点容忍。升级时先在新节点上设置 `sandbox.example.com/runtime-version`，然后将
-`levels.yaml` 的 `kata-fc.runtimeClassName` 切到版本化名称；旧沙箱排空后再撤旧类。
+目标 `SandboxPool.spec.runtimeClassName` 切到版本化名称；旧库存排空后再撤旧类。
 
 ## 3. node-agent
 
@@ -49,3 +49,15 @@ Agent 为访问 CRI socket 和写宿主 cgroup 以 root 身份运行，RBAC 将�
 
 镜像预热目前针对模板公开镜像；私有仓库认证需要后续接入节点 CRI 的认证配置。
 所有节点会预热所有模板镜像，模板规模增大时需要加节点池筛选与拉取预算。
+
+## 4. 出口策略与一致性验证
+
+平台在 `config/egress/profiles.yaml` 策展允许的域名和端口。Kata 沙箱创建 Pod
+之前，控制器按模板的 `egressProfile` 建立单沙箱 CiliumNetworkPolicy：DNS 只解析
+档位域名，HTTPS 只允许 FQDN 白名单，入站只允许 `sandbox-gateway`，出站显式拒绝
+API Server 与元数据 IP。策略缺失或档位无效时拒绝创建 Kata Pod。
+
+`hack/conformance/run.py` 在 E2 节点执行 T1–T9；
+`hack/conformance/report.py` 从原始 JSON 生成分阶段启动延迟、密度曲线和候选
+`maxSandboxesPerNode`；`hack/e2/kata_upgrade.py` 记录版本化 RuntimeClass 切换和
+强制回滚。采集命令与尚未采集的状态见[基线记录](../reports/m2-e2-baseline.md)。

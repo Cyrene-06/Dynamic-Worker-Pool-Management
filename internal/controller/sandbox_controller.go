@@ -54,7 +54,9 @@ type SandboxReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Resolver *isolation.Resolver
-	Recorder record.EventRecorder
+	// CiliumClient is uncached because Cilium CRDs are not part of the manager scheme.
+	CiliumClient client.Client
+	Recorder     record.EventRecorder
 
 	// StateFlusher 负责状态外置落盘（L3）。为空时使用 DisabledFlusher，
 	// 它会明确拒绝而不是假装落盘成功。
@@ -81,6 +83,26 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if !controllerutil.ContainsFinalizer(&sbx, FinalizerLeaseCleanup) {
 		return r.ensureFinalizers(ctx, &sbx)
+	}
+	if sbx.Status.PodName != "" {
+		if err := r.ensureNetworkPolicy(ctx, &sbx); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if isVMIsolation(sbx.Status.IsolationLevel) && sbx.Status.PodName != "" {
+		tmpl := r.templateFor(ctx, &sbx)
+		if tmpl == nil {
+			if err := r.quarantineCiliumPolicy(ctx, &sbx); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, fmt.Errorf("模板 %q 不存在；Cilium 出口已隔离", sbx.Spec.TemplateRef.Name)
+		}
+		if err := r.ensureCiliumPolicy(ctx, &sbx, tmpl); err != nil {
+			if quarantineErr := r.quarantineCiliumPolicy(ctx, &sbx); quarantineErr != nil {
+				return ctrl.Result{}, fmt.Errorf("出口策略错误: %v；隔离失败: %w", err, quarantineErr)
+			}
+			return ctrl.Result{}, err
+		}
 	}
 
 	// 崩溃恢复：已经决定回收、但对象还没删掉。
@@ -455,6 +477,15 @@ func (r *SandboxReconciler) ensurePod(
 		r.Recorder.Eventf(sbx, corev1.EventTypeWarning, "IsolationDegraded",
 			"请求 %s，实际生效 %s", av.RequestedLevel, av.Level)
 	}
+	if sbx.Spec.RuntimeClassName != "" && av.Degraded {
+		return fmt.Errorf("沙箱 %s 指定 RuntimeClass %s，不允许降级到 %s", sbx.Name, sbx.Spec.RuntimeClassName, av.Level)
+	}
+	if err := validateRuntimeClassOverride(ctx, r.Client, sbx.Spec.Isolation, sbx.Spec.RuntimeClassName); err != nil {
+		return err
+	}
+	if sbx.Spec.RuntimeClassName != "" {
+		av.RuntimeClassName = sbx.Spec.RuntimeClassName
+	}
 
 	// 网络策略在 Pod **之前**创建。
 	//
@@ -463,6 +494,11 @@ func (r *SandboxReconciler) ensurePod(
 	// 默认拒绝是要关门，门就应当在房间里有人之前装好。
 	if err := r.ensureNetworkPolicy(ctx, sbx); err != nil {
 		return err
+	}
+	if isVMIsolation(av.Level) {
+		if err := r.ensureCiliumPolicy(ctx, sbx, tmpl); err != nil {
+			return err
+		}
 	}
 
 	labels := map[string]string{

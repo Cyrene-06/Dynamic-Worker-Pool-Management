@@ -140,11 +140,17 @@ func main() {
 	}
 
 	// ---- 控制器 ----
+	ciliumClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme(), Mapper: mgr.GetRESTMapper()})
+	if err != nil {
+		logger.Error(err, "创建 Cilium 客户端失败")
+		os.Exit(1)
+	}
 	if err := (&controller.SandboxReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Resolver: resolver,
-		Recorder: mgr.GetEventRecorderFor("sandbox-controller"),
+		Client:       mgr.GetClient(),
+		CiliumClient: ciliumClient,
+		Scheme:       mgr.GetScheme(),
+		Resolver:     resolver,
+		Recorder:     mgr.GetEventRecorderFor("sandbox-controller"),
 		// 状态落盘（L3）目前显式使用 DisabledFlusher：
 		// 它对启用了 state.externalize 的沙箱会**返回错误**，而不是假装成功。
 		//
