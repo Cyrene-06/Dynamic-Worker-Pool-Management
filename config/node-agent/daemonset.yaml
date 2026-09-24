@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sandbox-node-agent
+  namespace: sandbox-system
+spec:
+  selector:
+    matchLabels:
+      app: sandbox-node-agent
+  template:
+    metadata:
+      labels:
+        app: sandbox-node-agent
+        sandbox.example.com/role: node-agent
+    spec:
+      serviceAccountName: sandbox-node-agent
+      nodeSelector:
+        sandbox.example.com/isolation: kata-fc
+      tolerations:
+        - key: sandbox
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: node-agent
+          image: ghcr.io/cyrene-06/dwp-node-agent:dev
+          args: ["--namespace=sandbox-pool"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: health
+              containerPort: 8081
+          readinessProbe:
+            httpGet: {path: /healthz, port: health}
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: proc, mountPath: /host/proc, readOnly: true}
+            - {name: cgroup, mountPath: /host/sys/fs/cgroup}
+            - {name: cri, mountPath: /host/run/containerd}
+      volumes:
+        - name: proc
+          hostPath: {path: /proc, type: Directory}
+        - name: cgroup
+          hostPath: {path: /sys/fs/cgroup, type: Directory}
+        - name: cri
+          hostPath: {path: /run/containerd, type: Directory}

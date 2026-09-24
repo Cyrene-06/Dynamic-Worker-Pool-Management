@@ -117,6 +117,11 @@ powershell -ExecutionPolicy Bypass -File hack/kind-e2e.ps1 -Stage cluster,image,
 
 ### M2 · 隔离与运行时（4 周）
 
+**仓库实现状态（2026-09-24）**：前三项已加入 E2 引导脚本、RuntimeClass 清单与
+`sandbox-node-agent` 代码/DaemonSet；尚未在 KVM 宿主部署、构建镜像或执行运行时
+一致性验证，因此下面的退出标准仍全部未勾选。部署入口见
+[M2 E2 节点部署](11-m2-e2-bootstrap.md)。
+
 | 交付物 | 说明 |
 |---|---|
 | E2 单节点 KVM 环境 | 节点初始化脚本、kubeadm、Cilium、kata-deploy |

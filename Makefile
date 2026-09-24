@@ -26,6 +26,7 @@ IMAGE_TAG      ?= dev
 OPERATOR_IMAGE ?= $(IMAGE_REGISTRY)/dwp-operator:$(IMAGE_TAG)
 GATEWAY_IMAGE  ?= $(IMAGE_REGISTRY)/dwp-gateway:$(IMAGE_TAG)
 SWEEPER_IMAGE  ?= $(IMAGE_REGISTRY)/dwp-sweeper:$(IMAGE_TAG)
+NODE_AGENT_IMAGE ?= $(IMAGE_REGISTRY)/dwp-node-agent:$(IMAGE_TAG)
 
 # 多架构构建的目标平台（生产节点混用 x86 与 ARM 时用得上）。
 DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
@@ -84,7 +85,7 @@ vet: ## 静态检查
 	go vet ./...
 
 .PHONY: build
-build: ## 编译全部可执行文件（operator / gateway / sweeper）
+build: ## 编译全部可执行文件（operator / gateway / sweeper / node-agent）
 	go build ./...
 
 .PHONY: manifests-check
@@ -92,6 +93,8 @@ manifests-check: ## 校验全部 kustomize 清单可渲染（不需要集群）
 	kubectl kustomize config/crd > /dev/null
 	kubectl kustomize config/rbac > /dev/null
 	kubectl kustomize config/isolation > /dev/null
+	kubectl kustomize config/runtimeclass > /dev/null
+	kubectl kustomize config/node-agent > /dev/null
 	kubectl kustomize config/samples > /dev/null
 	kubectl kustomize config/manager > /dev/null
 	kubectl kustomize config/gateway > /dev/null
@@ -126,7 +129,7 @@ test-envtest: envtest-assets ## 跑需要真实 API Server 的测试（CAS 认�
 
 ##@ 容器镜像
 
-# 三个镜像出自**同一个** Dockerfile，用 --build-arg BINARY 选择编译哪个 cmd 包
+# 四个镜像出自**同一个** Dockerfile，用 --build-arg BINARY 选择编译哪个 cmd 包
 # （理由见 Dockerfile 头注释：避免"升级 Go 版本要改三处"）。
 # 需要 BuildKit（Docker 23+ 默认开启），因为用到了 cache mount。
 #
@@ -138,22 +141,25 @@ test-envtest: envtest-assets ## 跑需要真实 API Server 的测试（CAS 认�
 #   powershell -ExecutionPolicy Bypass -File hack/host-ready.ps1 -Mode repair
 # 第一次跑构建前请确认 `docker info` 有输出（README §2.6 / §2.8 有完整说明）。
 .PHONY: docker-build
-docker-build: ## 构建三个镜像（本地架构：operator / gateway / sweeper）
+docker-build: ## 构建四个镜像（本地架构：operator / gateway / sweeper / node-agent）
 	docker build $(DOCKER_BUILD_ARGS) --build-arg BINARY=operator -t $(OPERATOR_IMAGE) .
 	docker build $(DOCKER_BUILD_ARGS) --build-arg BINARY=gateway  -t $(GATEWAY_IMAGE) .
 	docker build $(DOCKER_BUILD_ARGS) --build-arg BINARY=sweeper  -t $(SWEEPER_IMAGE) .
+	docker build $(DOCKER_BUILD_ARGS) --build-arg BINARY=node-agent -t $(NODE_AGENT_IMAGE) .
 
 .PHONY: docker-buildx
 docker-buildx: ## 多架构构建并直接推送（需要先 docker login）
 	docker buildx build --platform $(DOCKER_PLATFORMS) $(DOCKER_BUILD_ARGS) --build-arg BINARY=operator -t $(OPERATOR_IMAGE) --push .
 	docker buildx build --platform $(DOCKER_PLATFORMS) $(DOCKER_BUILD_ARGS) --build-arg BINARY=gateway  -t $(GATEWAY_IMAGE) --push .
 	docker buildx build --platform $(DOCKER_PLATFORMS) $(DOCKER_BUILD_ARGS) --build-arg BINARY=sweeper  -t $(SWEEPER_IMAGE) --push .
+	docker buildx build --platform $(DOCKER_PLATFORMS) $(DOCKER_BUILD_ARGS) --build-arg BINARY=node-agent -t $(NODE_AGENT_IMAGE) --push .
 
 .PHONY: docker-push
-docker-push: ## 推送本地架构的三个镜像（需要先 docker login）
+docker-push: ## 推送本地架构的四个镜像（需要先 docker login）
 	docker push $(OPERATOR_IMAGE)
 	docker push $(GATEWAY_IMAGE)
 	docker push $(SWEEPER_IMAGE)
+	docker push $(NODE_AGENT_IMAGE)
 
 # Dockerfile 的静态检查。
 #

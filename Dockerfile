@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # ---------------------------------------------------------------------------
-# Agent 沙箱控制面 —— operator / gateway / sweeper 共用的多阶段构建。
+# Agent 沙箱控制面 —— operator / gateway / sweeper / node-agent 共用的多阶段构建。
 #
 # 为什么要一个 Dockerfile 而不是三个：
 #   三个镜像的唯一差别是**编译哪个 cmd 包**，基础镜像、构建参数、运行镜像
@@ -11,6 +11,7 @@
 #   docker build --build-arg BINARY=operator -t dwp-operator:dev .
 #   docker build --build-arg BINARY=gateway  -t dwp-gateway:dev  .
 #   docker build --build-arg BINARY=sweeper  -t dwp-sweeper:dev  .
+#   docker build --build-arg BINARY=node-agent -t dwp-node-agent:dev .
 #
 # 需要 BuildKit（Docker 23+ 默认开启）：下面的 `--mount=type=cache` 是
 # 构建期缓存挂载，经典构建器不支持。
@@ -108,7 +109,7 @@ ARG VERSION=0.0.0-dev
 # 可见性与权限都得手工维护。
 LABEL org.opencontainers.image.source="https://github.com/Cyrene-06/Dynamic-Worker-Pool-Management" \
       org.opencontainers.image.title="Dynamic Worker Pool Management" \
-      org.opencontainers.image.description="Kubernetes control plane for agent sandboxes (operator / gateway / sweeper)" \
+      org.opencontainers.image.description="Kubernetes control plane and node agent for agent sandboxes" \
       org.opencontainers.image.version="${VERSION}"
 
 COPY --from=builder /out/app /app

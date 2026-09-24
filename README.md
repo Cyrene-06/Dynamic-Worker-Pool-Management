@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/cilium-1.16-green" alt="cilium" />
   <img src="https://img.shields.io/badge/karpenter-v1-yellow" alt="karpenter" />
   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license" />
-  <img src="https://img.shields.io/badge/status-M1%20已关闭%20%7C%20M2%20待启动-yellow" alt="status" />
+  <img src="https://img.shields.io/badge/status-M1%20已关闭%20%7C%20M2%20实施中-yellow" alt="status" />
   <img src="https://img.shields.io/badge/PRs-welcome-brightgreen" alt="PRs welcome" />
 </div>
 
@@ -39,6 +39,7 @@
 - **可观测性与安全**: [docs/08-observability-security.md](docs/08-observability-security.md)
 - **多环境部署方案**: [docs/09-deployment-environments.md](docs/09-deployment-environments.md)
 - **里程碑与风险登记**: [docs/10-roadmap-risks.md](docs/10-roadmap-risks.md)
+- **M2 E2 节点部署与 node-agent**: [docs/11-m2-e2-bootstrap.md](docs/11-m2-e2-bootstrap.md)
 
 ## 架构速览
 
@@ -78,7 +79,7 @@ flowchart LR
 
 ## 重要提示
 
-1. **M1（池化与生命周期）已于 2026-09-22 关闭，M2 待启动**：控制面交付物齐备 —— `PoolController`（水位闭环 / 阻尼 / 限速）、CAS 认领协议、TTL/空闲/心跳回收、5 步 Finalizer 链 + Sweeper 对账、`sandbox-gateway`（REST / 鉴权 / 配额 / 幂等 / 错误语义）、雪崩保护（`protectMode`）、三镜像共用一个 `Dockerfile`、`config/manager/` 部署清单。**但 8 项退出标准里 5 项未执行、3 项只完成一半**，原因全部是同一个：本机缺一个能跑 Linux 容器的宿主，不是代码或设计问题。逐条状态与解除条件见 [docs/10 §1 M1 关闭记录](docs/10-roadmap-risks.md)；**未验证项的唯一状态源是本文 §2.6**（⚠️/❌ 不是装饰）。隔离验证仍需带 `/dev/kvm` 的环境。
+1. **M1（池化与生命周期）已于 2026-09-22 关闭，M2 前三项正在实施**：控制面交付物齐备 —— `PoolController`（水位闭环 / 阻尼 / 限速）、CAS 认领协议、TTL/空闲/心跳回收、5 步 Finalizer 链 + Sweeper 对账、`sandbox-gateway`（REST / 鉴权 / 配额 / 幂等 / 错误语义）、雪崩保护（`protectMode`）、共用 `Dockerfile`、`config/manager/` 部署清单。M2 已加入 E2 引导、RuntimeClass 与 node-agent 的仓库实现，尚未在 KVM 宿主部署。**M1 的 8 项退出标准仍有 5 项未执行、3 项只完成一半**。逐条状态与解除条件见 [docs/10 §1 M1 关闭记录](docs/10-roadmap-risks.md)；**未验证项的唯一状态源是本文 §2.6**（⚠️/❌ 不是装饰）。隔离验证仍需带 `/dev/kvm` 的环境。
 2. 阅读或实践本项目需要一定的 **Kubernetes Operator 开发（Go）** 与 **容器运行时** 基础。
 3. 主隔离方案 Kata Containers + Firecracker 要求节点具备 `/dev/kvm`（裸金属或支持嵌套虚拟化的实例）；**本地 kind 环境无法真实验证隔离**，只能用 `simulated` 模式验证控制逻辑。
 4. 文档中所有性能数字均为**量级参考**，必须以本项目的压测基线校正后才能写入 SLO。
@@ -488,7 +489,7 @@ stateDiagram-v2
 └── go.mod  go.sum
 ```
 
-**规划中（M2 及以后）**：`cmd/node-agent`、`template_controller`、`resource_optimizer`、
+**规划中（M2 及以后）**：`template_controller`、`resource_optimizer`、
 `test/e2e`（集群内端到端；Windows 入口是 `hack/kind-e2e.ps1`）、
 `test/conformance`（Kata 一致性套件）、控制器与对账侧的指标导出（现为显式占位，M3 接入）、
 以及可直接导入的 Grafana 看板 JSON（面板设计见 [docs/08 §6](docs/08-observability-security.md)）。

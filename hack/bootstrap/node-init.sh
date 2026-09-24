@@ -45,7 +45,7 @@ fi
 
 # 嵌套虚拟化：裸金属上该参数无意义，云 VM 上必须开启
 for f in /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested; do
-    if [ -e "$f" ]; then
+    if [ -e "$f" ] && systemd-detect-virt --vm --quiet; then
         case "$(cat "$f")" in
             1|Y|y) log "嵌套虚拟化已开启 ($f)" ;;
             *) fail "嵌套虚拟化未开启 ($f)。云 VM 需显式启用，否则 Firecracker 无法启动。" ;;
@@ -86,24 +86,26 @@ done
 #          "隐性超卖"收益。
 # 因此短生命周期池与长驻池应该用两套节点规格/配置，而不是全局统一。
 # ---------------------------------------------------------------------------
-log "预留大页（4096 × 2MiB = 8GiB）"
-echo 4096 > /proc/sys/vm/nr_hugepages
-cat >/etc/sysctl.d/98-sandbox-hugepages.conf <<'EOF'
-vm.nr_hugepages=4096
-EOF
+HUGEPAGES_2M_COUNT="${HUGEPAGES_2M_COUNT:-0}"
+if [ "$HUGEPAGES_2M_COUNT" -gt 0 ]; then
+    log "预留 ${HUGEPAGES_2M_COUNT} × 2MiB 大页"
+    echo "$HUGEPAGES_2M_COUNT" > /proc/sys/vm/nr_hugepages
+    printf 'vm.nr_hugepages=%s\n' "$HUGEPAGES_2M_COUNT" >/etc/sysctl.d/98-sandbox-hugepages.conf
+else
+    log "未预留大页；待 M2 prealloc/hugepages 基准测试后设定"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. 本地盘（镜像层与沙箱临时盘）
 # ---------------------------------------------------------------------------
 log "准备本地盘挂载点"
 mkdir -p /var/lib/sandbox /var/lib/sandbox/scratch
-# ⚠️ 设备名需按实际环境调整；此处仅演示意图，不要照抄到生产。
-if [ -b /dev/nvme1n1 ] && ! blkid /dev/nvme1n1 >/dev/null 2>&1; then
-    mkfs.ext4 -F /dev/nvme1n1
-fi
-if [ -b /dev/nvme1n1 ]; then
+# 数据盘需要显式指定并事先格式化。绝不按猜测的设备名自动 mkfs。
+if [ -n "${SANDBOX_DATA_DEVICE:-}" ]; then
+    [ -b "$SANDBOX_DATA_DEVICE" ] || fail "SANDBOX_DATA_DEVICE 不是块设备"
+    blkid "$SANDBOX_DATA_DEVICE" >/dev/null 2>&1 || fail "数据盘未格式化；请人工确认并格式化"
     grep -q ' /var/lib/sandbox ' /etc/fstab || \
-        echo "/dev/nvme1n1 /var/lib/sandbox ext4 defaults,noatime,nodiratime 0 2" >>/etc/fstab
+        echo "$SANDBOX_DATA_DEVICE /var/lib/sandbox ext4 defaults,noatime,nodiratime 0 2" >>/etc/fstab
     mount -a
 fi
 
@@ -112,6 +114,7 @@ fi
 # ---------------------------------------------------------------------------
 if [ -f /etc/containerd/sandbox.toml ]; then
     log "应用 containerd 沙箱运行时配置"
+    mkdir -p /etc/containerd/conf.d
     install -m 0644 /etc/containerd/sandbox.toml /etc/containerd/conf.d/99-sandbox.toml
     systemctl restart containerd
 else
